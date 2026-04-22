@@ -1,0 +1,38 @@
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Token cache
+.moodle_token_cache.json
+token_cache.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv
+.uv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# oh-my-claudecode session state
+.omc/
