@@ -8,8 +8,14 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 
 from .config import MoodleConfig
+from .downloader import download_course as run_download_course
 from .html_utils import html_to_plaintext
 from .moodle_client import MoodleAPIError, MoodleAuthError, MoodleClient
+from .submissions import (
+    get_submission_status as run_get_submission_status,
+    get_upcoming_deadlines as run_get_upcoming_deadlines,
+    submit_assignment as run_submit_assignment,
+)
 
 
 _ASSIGN_MODNAMES = {"assign"}
@@ -164,5 +170,116 @@ def create_server(config: MoodleConfig) -> FastMCP:
         except (MoodleAuthError, MoodleAPIError) as err:
             return f"Fehler: {err}"
         return _format_course_content(sections, assignments)
+
+    @mcp.tool()
+    async def download_course(course_id: int) -> str:
+        """Lade den gesamten Kurs (Text + alle Anhänge) in den lokalen Dokumente-Ordner.
+
+        Legt folgende Struktur an:
+            <MOODLE_DOWNLOAD_ROOT>/<host>/<Kategorie>/<Kurs>/<Kurs>.md
+                                                      /Anhänge/<Section>/<Modul>/…
+                                                      /Abgaben/   (leer, für Submit-Files)
+
+        Die erzeugte .md ist Obsidian-freundlich (YAML-Frontmatter, relative Links).
+        Bereits vorhandene Dateien mit passender Größe werden übersprungen.
+
+        Args:
+            course_id: die numerische Moodle-Kurs-ID (siehe list_courses).
+        """
+        try:
+            client = await get_client()
+            manifest = await run_download_course(
+                client=client,
+                course_id=course_id,
+                download_root=config.download_root,
+                moodle_url=config.url or "",
+            )
+        except (MoodleAuthError, MoodleAPIError) as err:
+            return f"Fehler: {err}"
+
+        lines = [
+            f"# Download — {manifest.course_name}",
+            "",
+            f"- Kurs-ID: **{manifest.course_id}**",
+            f"- Kurs-Ordner: `{manifest.course_dir}`",
+            f"- Markdown: `{manifest.markdown_path.name}`",
+            f"- Neu heruntergeladen: **{len(manifest.downloaded)}** Dateien "
+            f"({manifest.total_bytes} Bytes)",
+            f"- Übersprungen (bereits aktuell): **{len(manifest.skipped)}**",
+        ]
+        if manifest.failed:
+            lines.append(f"- Fehlgeschlagen: **{len(manifest.failed)}**")
+            for fpath, err in manifest.failed[:10]:
+                lines.append(f"  - {fpath}: {err}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def submit_assignment(
+        course_id: int,
+        assign_id: int,
+        text: Optional[str] = None,
+        file_paths: Optional[list[str]] = None,
+        i_confirm: bool = False,
+        final: bool = False,
+    ) -> str:
+        """Reicht eine Aufgabe in Moodle ein.
+
+        ⚠️  WICHTIG — destruktiv / kaum reversibel. Verhalten nach `i_confirm`:
+
+        - `i_confirm=False` (Default): **DRY RUN** — zeigt nur, was eingereicht würde.
+        - `i_confirm=True, final=False`: speichert als **Draft** in Moodle (reversibel).
+        - `i_confirm=True, final=True`: ruft **mod_assign_submit_for_grading** auf.
+
+        Niemals ohne ausdrückliche Bestätigung des Users mit `i_confirm=True` aufrufen.
+
+        Args:
+            course_id: die Kurs-ID (für Pfad-Auflösung der file_paths).
+            assign_id: die numerische Aufgaben-ID (aus mod_assign, siehe Kurs-Inhalt).
+            text: optionaler Online-Text (Plaintext; wird zu HTML konvertiert).
+            file_paths: optionale Datei-Pfade. Absolute Pfade werden direkt genommen,
+                relative Pfade werden gegen `<Kurs-Ordner>/Abgaben/` aufgelöst.
+            i_confirm: EXPLIZIT auf True setzen, um wirklich einzureichen.
+            final: zusätzlich auf True für finales Abgeben (`submit_for_grading`).
+        """
+        try:
+            client = await get_client()
+            return await run_submit_assignment(
+                client=client,
+                config=config,
+                course_id=course_id,
+                assign_id=assign_id,
+                text=text,
+                file_paths=file_paths,
+                i_confirm=i_confirm,
+                final=final,
+            )
+        except (MoodleAuthError, MoodleAPIError) as err:
+            return f"Fehler: {err}"
+
+    @mcp.tool()
+    async def get_submission_status(assign_id: int) -> str:
+        """Zeigt Abgabestatus einer Aufgabe: hast du eingereicht, Note, Lehrer-Feedback.
+
+        Args:
+            assign_id: die numerische Aufgaben-ID.
+        """
+        try:
+            client = await get_client()
+            return await run_get_submission_status(client, assign_id)
+        except (MoodleAuthError, MoodleAPIError) as err:
+            return f"Fehler: {err}"
+
+    @mcp.tool()
+    async def get_upcoming_deadlines(days: int = 14) -> str:
+        """Zeigt alle fälligen Aufgaben quer über alle Kurse, sortiert nach Deadline.
+
+        Args:
+            days: Zeitfenster in Tagen (Default 14).
+        """
+        try:
+            client = await get_client()
+            return await run_get_upcoming_deadlines(client, days=days)
+        except (MoodleAuthError, MoodleAPIError) as err:
+            return f"Fehler: {err}"
 
     return mcp

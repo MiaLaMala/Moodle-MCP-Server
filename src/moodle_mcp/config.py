@@ -33,6 +33,14 @@ def _default_cache_path() -> Path:
     return Path.home() / ".cache" / "moodle-mcp" / "token.json"
 
 
+def _default_download_root() -> Path:
+    return Path.home() / "Documents"
+
+
+def _default_submissions_log() -> Path:
+    return Path.home() / ".moodle-mcp" / "submissions.log"
+
+
 class MoodleConfig(BaseSettings):
     """Runtime configuration.
 
@@ -55,6 +63,8 @@ class MoodleConfig(BaseSettings):
     token: Optional[str] = Field(default=None)
     token_cache: Path = Field(default_factory=_default_cache_path)
     timeout: float = Field(default=30.0)
+    download_root: Path = Field(default_factory=_default_download_root)
+    submissions_log: Path = Field(default_factory=_default_submissions_log)
 
     @property
     def has_direct_token(self) -> bool:

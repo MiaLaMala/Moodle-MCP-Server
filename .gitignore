@@ -3,9 +3,11 @@
 .env.local
 .env.*.local
 
-# Token cache
+# Token cache + submissions audit log (if user sets MOODLE_* paths inside the repo)
 .moodle_token_cache.json
 token_cache.json
+.moodle-mcp/
+moodle_downloads/
 
 # Python
 __pycache__/

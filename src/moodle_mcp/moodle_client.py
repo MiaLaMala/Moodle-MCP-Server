@@ -264,3 +264,138 @@ class MoodleClient:
             if course.get("id") == course_id:
                 return course.get("assignments") or []
         return []
+
+    # ------------------------------------------------------------------ categories
+    async def get_category_name(self, category_id: int) -> Optional[str]:
+        """Resolve a category id to its name.
+
+        Returns ``None`` when the category cannot be fetched (permissions,
+        missing id, etc.) — callers should fall back to a generic folder.
+        """
+        try:
+            result = await self._ws_call(
+                "core_course_get_categories",
+                {
+                    "criteria[0][key]": "id",
+                    "criteria[0][value]": category_id,
+                },
+            )
+        except MoodleAPIError as err:
+            logger.warning("core_course_get_categories failed for id=%s: %s", category_id, err)
+            return None
+        if isinstance(result, list) and result:
+            first = result[0]
+            if isinstance(first, dict):
+                name = first.get("name")
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
+        return None
+
+    # ------------------------------------------------------------------ file download
+    async def download_file(self, file_url: str, dest_path: "Path") -> int:
+        """Stream-download a Moodle file (pluginfile.php URL) to ``dest_path``.
+
+        Appends the Web Services token as a query parameter. Creates parent
+        directories as needed. Returns the number of bytes written.
+        """
+        token = await self._ensure_token()
+        separator = "&" if "?" in file_url else "?"
+        url = f"{file_url}{separator}token={token}"
+
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        bytes_written = 0
+        try:
+            async with self._http.stream("GET", url) as response:
+                if response.status_code in (401, 403):
+                    # Try one re-auth pass.
+                    self._token = None
+                    self._invalidate_cache()
+                    token = await self._ensure_token()
+                    retry_url = f"{file_url}{separator}token={token}"
+                    async with self._http.stream("GET", retry_url) as retry:
+                        retry.raise_for_status()
+                        with dest_path.open("wb") as fh:
+                            async for chunk in retry.aiter_bytes():
+                                fh.write(chunk)
+                                bytes_written += len(chunk)
+                    return bytes_written
+
+                response.raise_for_status()
+                with dest_path.open("wb") as fh:
+                    async for chunk in response.aiter_bytes():
+                        fh.write(chunk)
+                        bytes_written += len(chunk)
+        except httpx.HTTPError as err:
+            raise MoodleAPIError(f"Datei-Download fehlgeschlagen ({file_url}): {err}") from err
+        return bytes_written
+
+    # ------------------------------------------------------------------ submissions
+    async def get_submission_status(self, assign_id: int) -> dict[str, Any]:
+        result = await self._ws_call(
+            "mod_assign_get_submission_status",
+            {"assignid": assign_id},
+        )
+        return result if isinstance(result, dict) else {}
+
+    async def upload_file(self, file_path: "Path", itemid: int = 0) -> int:
+        """Upload a local file to Moodle's user draft area.
+
+        Passing ``itemid=0`` creates a new draft area and returns its id.
+        Re-using that id for subsequent uploads groups the files into a
+        single submission draft.
+        """
+        token = await self._ensure_token()
+        url = f"{self.config.url}/webservice/upload.php"
+        try:
+            with file_path.open("rb") as fh:
+                files = {"file_box": (file_path.name, fh)}
+                data = {"token": token, "filearea": "draft", "itemid": str(itemid)}
+                response = await self._http.post(url, data=data, files=files)
+        except OSError as err:
+            raise MoodleAPIError(f"Konnte Datei nicht öffnen: {err}") from err
+        except httpx.HTTPError as err:
+            raise MoodleAPIError(f"Upload fehlgeschlagen: {err}") from err
+
+        try:
+            payload = response.json()
+        except ValueError as err:
+            raise MoodleAPIError(f"Upload-Antwort war kein JSON: {response.text[:200]}") from err
+
+        if isinstance(payload, dict) and payload.get("error"):
+            raise MoodleAPIError(f"Upload abgelehnt: {payload.get('error')}")
+        if not isinstance(payload, list) or not payload:
+            raise MoodleAPIError(f"Upload gab unerwartete Antwort zurück: {payload}")
+
+        itemid = payload[0].get("itemid")
+        if itemid is None:
+            raise MoodleAPIError(f"Upload-Antwort enthielt kein itemid: {payload[0]}")
+        return int(itemid)
+
+    async def save_submission(
+        self,
+        assign_id: int,
+        online_text_html: Optional[str] = None,
+        file_itemid: Optional[int] = None,
+    ) -> Any:
+        """Save/update an assignment submission as a draft.
+
+        At least one of ``online_text_html`` or ``file_itemid`` must be given.
+        """
+        params: dict[str, Any] = {"assignmentid": assign_id}
+        if online_text_html is not None:
+            params["plugindata[onlinetext_editor][text]"] = online_text_html
+            params["plugindata[onlinetext_editor][format]"] = 1  # FORMAT_HTML
+            params["plugindata[onlinetext_editor][itemid]"] = 0
+        if file_itemid is not None:
+            params["plugindata[files_filemanager]"] = file_itemid
+
+        if len(params) == 1:
+            raise ValueError("save_submission: benötigt Text oder eine hochgeladene Datei")
+
+        return await self._ws_call("mod_assign_save_submission", params)
+
+    async def submit_for_grading(self, assign_id: int) -> Any:
+        return await self._ws_call(
+            "mod_assign_submit_for_grading",
+            {"assignmentid": assign_id, "acceptsubmissionstatement": 1},
+        )

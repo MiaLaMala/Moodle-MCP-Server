@@ -1,90 +1,137 @@
 # moodle-mcp
 
-Generic **Moodle MCP server** for AI assistants (Claude Desktop, Claude Code, and any other MCP client). Gives the AI read-only access to your Moodle courses via the official **Moodle Web Services API** — no copy-pasting course content into chat anymore.
+Ein generischer **Moodle-MCP-Server** für KI-Assistenten (Claude Desktop, Claude Code und jeden anderen MCP-Client). Gibt der KI Lesezugriff auf deine Moodle-Kurse über die offizielle **Moodle-Web-Services-API** — Schluss mit Copy-Paste von Moodle in den Chat.
 
-Written in Python with [FastMCP](https://github.com/modelcontextprotocol/python-sdk) and the `stdio` transport, so it plugs straight into any MCP-capable desktop client.
+Geschrieben in Python mit [FastMCP](https://github.com/modelcontextprotocol/python-sdk) und `stdio`-Transport.
 
-## What it does
+---
 
-Two tools, on purpose:
+## Was er kann
 
-| Tool                                 | Purpose                                                          |
-|--------------------------------------|------------------------------------------------------------------|
-| `list_courses()`                     | Enrolled courses: `id`, `shortname`, `fullname`, `category`.     |
-| `get_course_content(course_id: int)` | All sections and modules (assignments + info pages) as plaintext. |
+| Tool | Zweck |
+|------|-------|
+| `list_courses()` | Eingeschriebene Kurse: `id`, `shortname`, `fullname`, `category`. |
+| `get_course_content(course_id)` | Sections + Module (Aufgaben + Infotexte) als Plaintext. |
+| `download_course(course_id)` | Kompletter Kurs (MD-Datei + alle Anhänge + Ordner für Abgaben) ins Dokumente-Verzeichnis. |
+| `get_upcoming_deadlines(days=14)` | Kurs-übergreifende Übersicht fälliger Aufgaben. |
+| `get_submission_status(assign_id)` | Status einer Abgabe (eingereicht, Note, Lehrer-Feedback). |
+| `submit_assignment(...)` | Einreichen mit 3-stufigem Sicherheitsnetz (Dry-Run → Draft → final). |
 
-HTML from Moodle is converted to clean plaintext before the AI sees it. Assignments are enriched with their `duedate`.
+HTML von Moodle wird zu sauberem Plaintext konvertiert. Aufgaben bekommen ihr `duedate` dazu.
 
-## Non-goals (v1)
+---
 
-- ❌ Submitting assignment answers back to Moodle
-- ❌ PDF / file downloads
-- ❌ HTML scraping (official Web Services API only)
-- ❌ Quizzes / forums / chats
-- ❌ HTTP transport (stdio only)
+## Ordner-Struktur, die `download_course` anlegt
 
-## Requirements
+Alles landet Obsidian-freundlich in `~/Documents/<moodle-host>/<kategorie>/<kurs>/`:
+
+```
+~/Documents/
+└── lms.lernen.hamburg/
+    └── Fachinformatik/
+        └── IT25-Klassenseite/
+            ├── IT25-Klassenseite.md     ← YAML-Frontmatter, relative Links
+            ├── Anhänge/
+            │   ├── 01 - Section 1/
+            │   │   └── <Modulname>/
+            │   │       ├── script.pdf
+            │   │       └── aufgabe.docx
+            │   └── 02 - Section 2/
+            │       └── …
+            └── Abgaben/                 ← hier legst DU Files rein für submit
+                └── README.md
+```
+
+Die `.md` hat YAML-Frontmatter (`type: moodle-course`, `course_id`, `category`, `tags: [moodle]`) und relative Markdown-Links auf die Anhänge — rendert in Obsidian sofort korrekt, inklusive Datei-Vorschau.
+
+**Incremental Sync:** Beim zweiten Aufruf werden Dateien mit passender Größe übersprungen — Bandbreite sparen bei erneutem Download.
+
+---
+
+## Submit-Sicherheitsmodell
+
+Einreichen ist kaum reversibel, deshalb dreistufig:
+
+| Aufruf | Effekt |
+|--------|--------|
+| `submit_assignment(..., i_confirm=False)` | **Dry-Run** — zeigt nur, was passieren würde. Kein Moodle-Write. |
+| `submit_assignment(..., i_confirm=True, final=False)` | Speichert als **Draft** in Moodle (in der Web-UI weiter editierbar). |
+| `submit_assignment(..., i_confirm=True, final=True)` | Ruft **`mod_assign_submit_for_grading`** auf — final. |
+
+Zusätzlich:
+- Jede echte Aktion landet in `~/.moodle-mcp/submissions.log` (Zeit, Kurs, Assign, Dateinamen, Größen — niemals Text-Inhalt).
+- Relative Pfade in `file_paths` werden gegen `<Kurs>/Abgaben/` aufgelöst, absolute Pfade direkt genommen.
+- Claude wird angewiesen, das Tool niemals ohne User-Bestätigung mit `i_confirm=True` aufzurufen.
+
+---
+
+## Voraussetzungen
 
 - macOS / Linux / Windows
-- Python 3.10+ (uv will pick a suitable one for you)
-- [`uv`](https://docs.astral.sh/uv/) for dependency management: `brew install uv`
-- A Moodle instance with the **Mobile Web Service** enabled, **or** a pre-issued personal Web Services token
+- Python 3.10+ (uv bringt eine passende Version mit)
+- [`uv`](https://docs.astral.sh/uv/): `brew install uv`
+- Eine Moodle-Instanz mit aktiviertem **Mobile Web Service** — oder ein admin-ausgestellter persönlicher Web-Services-Token
 
-## Install
+## Installation
 
 ```bash
-git clone <your-fork-url> moodle-mcp
+git clone git@github.com:MiaLaMala/Moodle-MCP-Server.git moodle-mcp
 cd moodle-mcp
 uv sync
 ```
 
-## Configure
-
-Copy the example env file and fill in your Moodle URL + credentials:
+## Konfiguration
 
 ```bash
 cp .env.example .env
 $EDITOR .env
 ```
 
-Minimum you need is **the URL plus one auth method**:
+Minimum in `.env`:
 
 ```ini
 MOODLE_URL=https://lms.lernen.hamburg
 
-# Option A: the server exchanges username/password for a token on first run
-MOODLE_USERNAME=your.name
-MOODLE_PASSWORD=yourpassword
+# Option A — Username + Passwort (Server tauscht sie beim ersten Start gegen einen Token)
+MOODLE_USERNAME=mia.gruenwald
+MOODLE_PASSWORD=…
 
-# Option B: provide a pre-issued token (overrides username/password)
+# Option B — vorhandener Token (überschreibt A, falls beide gesetzt)
 # MOODLE_TOKEN=abcdef0123456789
+
+# Optional: wohin download_course speichert. Default: ~/Documents
+# MOODLE_DOWNLOAD_ROOT=/Users/mia/Obsidian/Vault/Moodle
+
+# Optional: Submission-Log (default ~/.moodle-mcp/submissions.log)
+# MOODLE_SUBMISSIONS_LOG=
 ```
 
-The token is cached at `~/.cache/moodle-mcp/token.json` so you don't re-authenticate on every server start. The cache is invalidated automatically on `401`.
+Der Token wird in `~/.cache/moodle-mcp/token.json` gecacht. Bei `401` automatisch invalidiert und neu getauscht.
 
-`.env` and the token cache are both in `.gitignore`. **Never commit them.**
+**`.env` und Token-Cache sind in `.gitignore` — niemals committen.**
 
-### Fail-fast behavior
+### Fail-Fast-Verhalten
 
-If `MOODLE_URL` is missing, the server aborts immediately with:
+- `MOODLE_URL` fehlt → sofortiger Abbruch: `Setze die URL für deine Moodle Platform`
+- URL ohne Schema → `MOODLE_URL muss mit http:// oder https:// beginnen`
+- Keine Auth → `Moodle-Authentifizierung fehlt. Setze entweder MOODLE_TOKEN oder MOODLE_USERNAME + MOODLE_PASSWORD`
+- Mobile Service aus → klare Meldung + Hinweis auf Admin-Token
 
-```
-Setze die URL für deine Moodle Platform
-```
+---
 
-If `/login/token.php` fails because the Mobile Service is disabled, the server tells you exactly that and asks for a personal admin-issued `MOODLE_TOKEN`.
-
-## Run locally
+## Lokal starten
 
 ```bash
 uv run moodle-mcp
 ```
 
-The process speaks MCP over stdio — it will sit silently waiting for an MCP client to connect. `Ctrl+C` to quit.
+Der Prozess spricht MCP über stdio und wartet stumm auf Input. `Ctrl+C` zum Beenden.
 
-## Wire it into Claude Desktop
+---
 
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+## In Claude Desktop einbinden
+
+`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
 
 ```json
 {
@@ -93,7 +140,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
       "command": "uv",
       "args": [
         "--directory",
-        "/absolute/path/to/moodle-mcp",
+        "/Users/mia/Desktop/moodle_mcp",
         "run",
         "moodle-mcp"
       ]
@@ -102,43 +149,63 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
 }
 ```
 
-Restart Claude Desktop. The two tools should show up in the 🔧 tools panel.
+Claude Desktop neu starten, und die 6 Tools tauchen im 🔧-Panel auf.
 
-> On Linux / Windows the config lives under `~/.config/Claude/` or `%APPDATA%\Claude\` respectively.
+> Linux / Windows: Config liegt unter `~/.config/Claude/` bzw. `%APPDATA%\Claude\`.
 
-## Wire it into Claude Code
-
-```bash
-claude mcp add moodle -- uv --directory /absolute/path/to/moodle-mcp run moodle-mcp
-```
-
-## Usage examples
-
-Once connected, try prompts like:
-
-- *"Zeig mir alle meine Moodle-Kurse."*
-- *"Lies den Kursinhalt von Kurs 842 und fass die offenen Aufgaben mit Fälligkeit zusammen."*
-- *"Welche Aufgaben aus Lernfeld 4 sind diese Woche fällig?"*
-
-## Development
-
-Run the tests:
+## In Claude Code einbinden
 
 ```bash
-uv run pytest
+claude mcp add moodle -- uv --directory /Users/mia/Desktop/moodle_mcp run moodle-mcp
 ```
 
-Project layout:
+---
+
+## Beispiel-Prompts
+
+Nach der Einbindung:
+
+- *"Welche Moodle-Kurse habe ich?"*
+- *"Lad mir den Kurs 224100 komplett runter."*
+- *"Zeig mir alle Deadlines der nächsten 14 Tage."*
+- *"Lies meine Abgabe-Datei aus Abgaben/hausaufgabe.pdf durch und reich sie im Dry-Run-Modus ein."*
+- *"Ok, jetzt wirklich einreichen als Draft."*
+- *"Gib's final ab."*
+
+---
+
+## Non-Goals
+
+- ❌ Quizzes / Foren / Chats
+- ❌ HTTP-Transport (nur stdio)
+- ❌ Submissions-Widerruf (Moodle-UI nutzen)
+
+---
+
+## Entwicklung
+
+```bash
+uv run pytest                          # Unit-Tests
+uv run python scripts/config_debug.py  # zeigt welche Env-Vars geladen sind
+uv run python scripts/live_smoke.py    # v1 Roundtrip gegen echte Instance
+uv run python scripts/live_smoke_v2.py # v2 mit Download in Tempdir
+```
+
+Projektstruktur:
 
 ```
 src/moodle_mcp/
-├── __main__.py       # uv run moodle-mcp → loads config, starts FastMCP
-├── config.py         # pydantic-settings + fail-fast validation
-├── html_utils.py     # HTML → plaintext
-├── moodle_client.py  # async Moodle Web Services wrapper
-└── server.py         # FastMCP tool definitions + output formatting
+├── __main__.py          # uv run moodle-mcp — lädt Config, startet FastMCP
+├── config.py            # pydantic-settings + Fail-Fast-Validation
+├── paths.py             # Sanitization + Ordner-Layout
+├── html_utils.py        # HTML → Plaintext
+├── markdown_renderer.py # Course → Obsidian-MD
+├── moodle_client.py     # async Web-Services-Wrapper + File-Download/Upload
+├── downloader.py        # download_course-Orchestrator (inkl. incremental)
+├── submissions.py       # submit/status/deadlines + Audit-Log
+└── server.py            # 6 FastMCP-Tool-Definitionen
 ```
 
-## License
+## Lizenz
 
 MIT.
