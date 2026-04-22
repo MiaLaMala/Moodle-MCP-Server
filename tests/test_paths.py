@@ -62,13 +62,30 @@ def test_build_course_dir_composes_full_path(tmp_path: Path) -> None:
         category_name="Lernfeld 3",
         course=course,
     )
-    assert path == tmp_path / "lms.lernen.hamburg" / "Lernfeld 3" / "ITS-Grundlagen"
+    assert path == (
+        tmp_path
+        / "lms.lernen.hamburg"
+        / "Lernfeld 3"
+        / "Kurse"
+        / "ITS-Grundlagen"
+    )
+
+
+def test_build_course_dir_always_contains_kurse_group(tmp_path: Path) -> None:
+    course = {"shortname": "X"}
+    path = build_course_dir(tmp_path, "https://m.example.com", "Lernfeld 1", course)
+    # "Kurse" sits between the category and the course shortname.
+    parts = path.parts
+    lf_idx = parts.index("Lernfeld 1")
+    assert parts[lf_idx + 1] == "Kurse"
+    assert parts[lf_idx + 2] == "X"
 
 
 def test_build_course_dir_falls_back_on_missing_category(tmp_path: Path) -> None:
     course = {"shortname": "X"}
     path = build_course_dir(tmp_path, "https://m.example.com", None, course)
     assert "Unkategorisiert" in path.parts
+    assert "Kurse" in path.parts
 
 
 def test_attachments_subdir_prefixes_with_index(tmp_path: Path) -> None:

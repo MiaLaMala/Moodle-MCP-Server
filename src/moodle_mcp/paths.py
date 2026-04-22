@@ -5,12 +5,14 @@ Directory convention:
     <download_root>/
       <moodle-host>/             ← e.g. lms.lernen.hamburg
         <category>/              ← e.g. "Lernfeld 3"
-          <course-shortname>/
-            <course-shortname>.md
-            Anhänge/
-              <section>/
-                <filename>
-            Abgaben/             ← user drops submission files here
+          Kurse/                 ← groups Moodle courses, leaves room for
+                                    personal notes at the Lernfeld level
+            <course-shortname>/
+              <course-shortname>.md
+              Anhänge/
+                <section>/
+                  <filename>
+              Abgaben/           ← user drops submission files here
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from urllib.parse import urlparse
 
 ATTACHMENTS_DIR = "Anhänge"
 SUBMISSIONS_DIR = "Abgaben"
+COURSES_DIR = "Kurse"
 
 _BAD_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -64,11 +67,15 @@ def build_course_dir(
     category_name: str | None,
     course: dict[str, Any],
 ) -> Path:
-    """Compose ``<download_root>/<host>/<category>/<course-shortname>/``."""
+    """Compose ``<download_root>/<host>/<category>/Kurse/<course-shortname>/``.
+
+    The intermediate ``Kurse/`` folder keeps Moodle-imported content isolated
+    from anything else the user keeps at the Lernfeld level (notes, projects).
+    """
     host = sanitize_path_component(get_host_from_url(moodle_url))
     category = sanitize_path_component(category_name or "Unkategorisiert")
     short = sanitize_path_component(course.get("shortname") or course.get("fullname"))
-    return Path(download_root) / host / category / short
+    return Path(download_root) / host / category / COURSES_DIR / short
 
 
 def attachments_subdir(course_dir: Path, section_name: str | None, index: int) -> Path:

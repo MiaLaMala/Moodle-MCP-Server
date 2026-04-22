@@ -28,18 +28,21 @@ Alles landet Obsidian-freundlich in `~/Documents/<moodle-host>/<kategorie>/<kurs
 ```
 ~/Documents/
 └── lms.lernen.hamburg/
-    └── Fachinformatik/
-        └── IT25-Klassenseite/
-            ├── IT25-Klassenseite.md     ← YAML-Frontmatter, relative Links
-            ├── Anhänge/
-            │   ├── 01 - Section 1/
-            │   │   └── <Modulname>/
-            │   │       ├── script.pdf
-            │   │       └── aufgabe.docx
-            │   └── 02 - Section 2/
-            │       └── …
-            └── Abgaben/                 ← hier legst DU Files rein für submit
-                └── README.md
+    └── Lernfeld 3/                      ← deine Moodle-Kategorie; hier
+        │                                  kannst du auch eigene Notizen/
+        │                                  Projekte ablegen
+        └── Kurse/                       ← alles Moodle-Importierte liegt hier
+            └── IT25-Klassenseite/
+                ├── IT25-Klassenseite.md ← YAML-Frontmatter, relative Links
+                ├── Anhänge/
+                │   ├── 01 - Section 1/
+                │   │   └── <Modulname>/
+                │   │       ├── script.pdf
+                │   │       └── aufgabe.docx
+                │   └── 02 - Section 2/
+                │       └── …
+                └── Abgaben/             ← hier legst DU Files rein für submit
+                    └── README.md
 ```
 
 Die `.md` hat YAML-Frontmatter (`type: moodle-course`, `course_id`, `category`, `tags: [moodle]`) und relative Markdown-Links auf die Anhänge — rendert in Obsidian sofort korrekt, inklusive Datei-Vorschau.
