@@ -1,104 +1,136 @@
-"""Tests for the Obsidian-friendly course markdown renderer."""
+"""Tests for the 3-level markdown renderers (v2.1 layout)."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
 
-from moodle_mcp.markdown_renderer import render_course_markdown
+from moodle_mcp.markdown_renderer import (
+    render_course_overview,
+    render_module,
+    render_section_overview,
+)
 
 
 FIXED_TIME = datetime(2026, 4, 22, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _render(**overrides):
-    course = overrides.get("course", {
+# ---------------------------------------------------------------- course overview
+def test_course_overview_has_frontmatter_and_section_links(tmp_path: Path) -> None:
+    course = {
         "id": 224100,
         "shortname": "ITS-G",
         "fullname": "IT Sicherheit Grundlagen",
-        "summary": "<p>Einführung.</p>",
-    })
-    sections = overrides.get("sections", [])
-    return render_course_markdown(
+        "summary": "<p>Intro</p>",
+    }
+    kurs_md = tmp_path / "Kurs.md"
+    section_md = tmp_path / "Kurse" / "Fachenglisch" / "Section.md"
+    out = render_course_overview(
         course=course,
-        category_name=overrides.get("category_name", "Lernfeld 3"),
-        sections=sections,
-        assignments_by_cmid=overrides.get("assignments_by_cmid", {}),
-        attachments_by_module=overrides.get("attachments_by_module", {}),
-        course_root=overrides.get("course_root", Path("/tmp/course")),
+        category_name="Fachinformatik",
+        sections_with_paths=[({"name": "Fachenglisch"}, section_md)],
+        kurs_md_path=kurs_md,
         retrieved_at=FIXED_TIME,
     )
+    assert out.startswith("---\n")
+    assert "type: moodle-course" in out
+    assert "category: Fachinformatik" in out
+    assert "# IT Sicherheit Grundlagen" in out
+    # Relative link from Kurs.md down into Kurse/Fachenglisch/Section.md
+    assert "[Fachenglisch](Kurse/Fachenglisch/Section.md)" in out
 
 
-def test_renders_yaml_frontmatter_for_obsidian() -> None:
-    md = _render()
-    assert md.startswith("---\n")
-    assert "type: moodle-course" in md
-    assert "course_id: 224100" in md
-    assert "category: Lernfeld 3" in md
-    assert "tags: [moodle]" in md
+# ---------------------------------------------------------------- section overview
+def test_section_overview_groups_aufgaben_and_infotexte(tmp_path: Path) -> None:
+    course = {"id": 1}
+    section = {"name": "Fachenglisch", "summary": "<p>Willkommen</p>"}
+    section_md = tmp_path / "Kurse" / "Fachenglisch" / "Section.md"
 
+    assign_module = {"id": 10, "modname": "assign", "name": "Letter of Application"}
+    assign_meta = {"cmid": 10, "duedate": 1740000000}
+    assign_md = section_md.parent / "Aufgaben" / "Letter of Application" / "Letter of Application.md"
 
-def test_renders_title_and_metadata() -> None:
-    md = _render()
-    assert "# IT Sicherheit Grundlagen" in md
-    assert "**Kurs-ID:** 224100" in md
-    assert "**Kategorie:** Lernfeld 3" in md
-    assert "**Shortname:** ITS-G" in md
+    info_module = {"id": 11, "modname": "page", "name": "Vokabelliste"}
+    info_md = section_md.parent / "Infotexte" / "Vokabelliste" / "Vokabelliste.md"
 
-
-def test_section_and_module_headers() -> None:
-    sections = [{
-        "name": "Allgemein",
-        "summary": "<p>Hallo</p>",
-        "modules": [
-            {"id": 1, "name": "Aufgabe 1", "modname": "assign", "visible": 1,
-             "description": "<p>Bearbeite …</p>"},
-            {"id": 2, "name": "Info-Seite", "modname": "page", "visible": 1,
-             "description": "<p>Text.</p>"},
+    out = render_section_overview(
+        course=course,
+        section=section,
+        section_index=0,
+        modules_with_paths=[
+            (assign_module, assign_meta, assign_md),
+            (info_module, None, info_md),
         ],
-    }]
-    md = _render(sections=sections)
-    assert "## Allgemein" in md
-    assert "### Aufgabe 1 `[assign]`" in md
-    assert "### Info-Seite `[page]`" in md
+        section_md_path=section_md,
+    )
+
+    assert "## Aufgaben" in out
+    assert "## Infotexte" in out
+    assert "[Letter of Application](Aufgaben/" in out
+    assert "fällig" in out  # duedate formatted
+    assert "[Vokabelliste](Infotexte/" in out
+    assert "`[page]`" in out
 
 
-def test_assignment_due_date_rendered() -> None:
-    sections = [{
-        "name": "S1",
-        "modules": [{"id": 99, "name": "A", "modname": "assign", "visible": 1}],
-    }]
-    assignments = {99: {"cmid": 99, "duedate": 1740000000, "intro": "<p>X</p>"}}
-    md = _render(sections=sections, assignments_by_cmid=assignments)
-    assert "**Fällig:**" in md
-    assert "2025" in md  # 1740000000 is in 2025
+def test_section_overview_skips_empty_groups(tmp_path: Path) -> None:
+    section_md = tmp_path / "Section.md"
+    info = {"id": 1, "modname": "page", "name": "I"}
+    info_md = tmp_path / "Infotexte" / "I" / "I.md"
+    out = render_section_overview(
+        course={},
+        section={"name": "S"},
+        section_index=0,
+        modules_with_paths=[(info, None, info_md)],
+        section_md_path=section_md,
+    )
+    assert "## Infotexte" in out
+    assert "## Aufgaben" not in out
 
 
-def test_attachment_links_are_relative_and_url_safe() -> None:
-    course_root = Path("/tmp/course")
-    sections = [{
-        "name": "S1",
-        "modules": [{"id": 7, "name": "Modul", "modname": "resource", "visible": 1}],
-    }]
-    attachments = {7: [course_root / "Anhänge" / "01 - S1" / "datei mit space.pdf"]}
-    md = _render(sections=sections, attachments_by_module=attachments, course_root=course_root)
+# ---------------------------------------------------------------- module
+def test_module_assign_has_duedate_and_abgabe_section(tmp_path: Path) -> None:
+    module = {"id": 10, "modname": "assign", "name": "Aufgabe 1", "description": "<p>Do it.</p>"}
+    assign_meta = {"id": 555, "cmid": 10, "duedate": 1740000000, "intro": "<p>Aufgabentext</p>"}
+    md_path = tmp_path / "Aufgabe 1.md"
+    out = render_module(
+        course={"id": 1},
+        section={"name": "Fachenglisch"},
+        module=module,
+        assign_meta=assign_meta,
+        module_md_path=md_path,
+        attachment_paths=[],
+    )
+    assert "type: moodle-module" in out
+    assert "assign_id: 555" in out
+    assert "**Fällig:**" in out
+    assert "Aufgabentext" in out
+    assert "## Abgabe" in out
 
-    # Link is relative (no leading /) and uses forward slashes.
-    assert "Anh%C3%A4nge/01%20-%20S1/datei%20mit%20space.pdf" in md
-    assert "[datei mit space.pdf](" in md
-    # No absolute paths leaked.
-    assert "/tmp/course" not in md
+
+def test_module_info_has_no_abgabe_section(tmp_path: Path) -> None:
+    module = {"id": 11, "modname": "page", "name": "Vokabel", "description": "<p>List</p>"}
+    md_path = tmp_path / "Vokabel.md"
+    out = render_module(
+        course={"id": 1},
+        section={"name": "S"},
+        module=module,
+        assign_meta=None,
+        module_md_path=md_path,
+        attachment_paths=[],
+    )
+    assert "## Abgabe" not in out
+    assert "List" in out
 
 
-def test_invisible_modules_are_skipped() -> None:
-    sections = [{
-        "name": "S",
-        "modules": [
-            {"id": 1, "name": "sichtbar", "modname": "page", "visible": 1},
-            {"id": 2, "name": "versteckt", "modname": "page", "visible": 0},
-        ],
-    }]
-    md = _render(sections=sections)
-    assert "sichtbar" in md
-    assert "versteckt" not in md
+def test_module_attachment_links_are_relative_to_module_md(tmp_path: Path) -> None:
+    module = {"id": 1, "modname": "resource", "name": "Skript"}
+    md_path = tmp_path / "Skript.md"
+    attachment = tmp_path / "Anhänge" / "skript.pdf"
+    out = render_module(
+        course={}, section={}, module=module, assign_meta=None,
+        module_md_path=md_path, attachment_paths=[attachment],
+    )
+    assert "## Anhänge" in out
+    # `Anhänge` gets URL-encoded in links
+    assert "Anh%C3%A4nge/skript.pdf" in out
+    assert "[skript.pdf](" in out

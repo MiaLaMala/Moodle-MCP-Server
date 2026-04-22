@@ -1,18 +1,27 @@
 """Filesystem path helpers for Obsidian-friendly course downloads.
 
-Directory convention:
+Directory convention (v2.1 — one folder per Moodle module):
 
     <download_root>/
-      <moodle-host>/             ← e.g. lms.lernen.hamburg
-        <category>/              ← e.g. "Lernfeld 3"
-          Kurse/                 ← groups Moodle courses, leaves room for
-                                    personal notes at the Lernfeld level
-            <course-shortname>/
-              <course-shortname>.md
-              Anhänge/
-                <section>/
-                  <filename>
-              Abgaben/           ← user drops submission files here
+      <moodle-host>/                ← e.g. lms.lernen.hamburg
+        <category>/                 ← Moodle category, e.g. "Fachinformatik"
+          <course>/                 ← Moodle course (fullname), e.g. "IT25- Klassenseite"
+            Kurs.md                   — overview + links to every section
+            Kurse/                    ← fixed grouping
+              <section>/              ← Moodle section, e.g. "Fachenglisch"
+                Section.md              — overview + links to every module
+                Aufgaben/               ← fixed grouping (modname == "assign")
+                  <assignment-name>/
+                    <assignment-name>.md
+                    Anhänge/            ← teacher-provided files
+                    Abgabe/             ← USER drops files here for submit
+                Infotexte/              ← fixed grouping (everything else)
+                  <module-name>/
+                    <module-name>.md
+                    Anhänge/
+
+Personal notes / own project folders can live anywhere at the Lernfeld level
+— the ``Kurse/`` subfolder keeps Moodle-imported content isolated.
 """
 
 from __future__ import annotations
@@ -24,8 +33,12 @@ from urllib.parse import urlparse
 
 
 ATTACHMENTS_DIR = "Anhänge"
-SUBMISSIONS_DIR = "Abgaben"
+SUBMISSION_DIR = "Abgabe"
 COURSES_DIR = "Kurse"
+ASSIGNMENTS_GROUP_DIR = "Aufgaben"
+INFOTEXTS_GROUP_DIR = "Infotexte"
+
+_ASSIGN_MODNAMES = frozenset({"assign"})
 
 _BAD_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -34,14 +47,7 @@ _FALLBACK = "unbenannt"
 
 
 def sanitize_path_component(name: str | None) -> str:
-    """Make a string safe to use as a single file/directory name.
-
-    - Strips characters illegal on Windows/macOS.
-    - Collapses whitespace.
-    - Strips trailing dots/spaces (Windows gotcha).
-    - Truncates to :data:`_MAX_COMPONENT_LEN` characters.
-    - Returns ``"unbenannt"`` for empty input.
-    """
+    """Make a string safe to use as a single file/directory name."""
     if not name:
         return _FALLBACK
     cleaned = _BAD_CHARS_RE.sub("_", name)
@@ -55,10 +61,16 @@ def sanitize_path_component(name: str | None) -> str:
 
 
 def get_host_from_url(url: str) -> str:
-    """Return the hostname part of a Moodle URL, e.g. ``lms.lernen.hamburg``."""
     parsed = urlparse(url)
     host = parsed.hostname or ""
     return host or sanitize_path_component(url)
+
+
+def classify_module_group(modname: str | None) -> str:
+    """Return either ``Aufgaben`` or ``Infotexte`` depending on module type."""
+    if modname in _ASSIGN_MODNAMES:
+        return ASSIGNMENTS_GROUP_DIR
+    return INFOTEXTS_GROUP_DIR
 
 
 def build_course_dir(
@@ -67,26 +79,39 @@ def build_course_dir(
     category_name: str | None,
     course: dict[str, Any],
 ) -> Path:
-    """Compose ``<download_root>/<host>/<category>/Kurse/<course-shortname>/``.
+    """Compose ``<download_root>/<host>/<category>/<course>/``.
 
-    The intermediate ``Kurse/`` folder keeps Moodle-imported content isolated
-    from anything else the user keeps at the Lernfeld level (notes, projects).
+    Prefers the course's full name over its shortname — it is the label the
+    user recognizes from the Moodle UI.
     """
     host = sanitize_path_component(get_host_from_url(moodle_url))
     category = sanitize_path_component(category_name or "Unkategorisiert")
-    short = sanitize_path_component(course.get("shortname") or course.get("fullname"))
-    return Path(download_root) / host / category / COURSES_DIR / short
+    course_label = sanitize_path_component(
+        course.get("fullname") or course.get("shortname")
+    )
+    return Path(download_root) / host / category / course_label
 
 
-def attachments_subdir(course_dir: Path, section_name: str | None, index: int) -> Path:
-    """Folder where attachments of a given section are saved.
-
-    Prefixes the section name with its zero-padded index to preserve order
-    when viewing in a file manager / Obsidian.
-    """
+def build_section_dir(course_dir: Path, section_name: str | None, index: int) -> Path:
+    """``<course_dir>/Kurse/<section>/``."""
     section = sanitize_path_component(section_name or f"Section {index}")
-    return course_dir / ATTACHMENTS_DIR / f"{index:02d} - {section}"
+    return course_dir / COURSES_DIR / section
 
 
-def submissions_dir(course_dir: Path) -> Path:
-    return course_dir / SUBMISSIONS_DIR
+def build_module_dir(
+    section_dir: Path,
+    module_name: str | None,
+    modname: str | None,
+) -> Path:
+    """``<section_dir>/Aufgaben/<name>/`` or ``<section_dir>/Infotexte/<name>/``."""
+    group = classify_module_group(modname)
+    name = sanitize_path_component(module_name or "Modul")
+    return section_dir / group / name
+
+
+def module_attachments_dir(module_dir: Path) -> Path:
+    return module_dir / ATTACHMENTS_DIR
+
+
+def module_submission_dir(module_dir: Path) -> Path:
+    return module_dir / SUBMISSION_DIR

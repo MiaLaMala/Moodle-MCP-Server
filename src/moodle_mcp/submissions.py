@@ -20,7 +20,12 @@ from typing import Any, Optional
 
 from .config import MoodleConfig
 from .moodle_client import MoodleAPIError, MoodleClient
-from .paths import SUBMISSIONS_DIR, build_course_dir
+from .paths import (
+    build_course_dir,
+    build_module_dir,
+    build_section_dir,
+    module_submission_dir,
+)
 
 
 logger = logging.getLogger("moodle_mcp.submissions")
@@ -72,15 +77,24 @@ def _log_submission(
         logger.warning("Konnte submission log nicht schreiben (%s): %s", path, err)
 
 
-async def _resolve_course_dir(
+async def _resolve_assignment_abgabe_dir(
     client: MoodleClient,
     config: MoodleConfig,
     course_id: int,
+    assign_id: int,
 ) -> Optional[Path]:
+    """Build the on-disk ``<Modul>/Abgabe/`` folder for a given assignment.
+
+    Needs the course (for category + folder naming), the assignment record
+    (to map ``assign_id`` → ``cmid``), and the course contents (to find the
+    section containing that cmid). Returns ``None`` if any lookup fails —
+    the caller treats that as "file not found".
+    """
     courses = await client.list_courses()
     course = next((c for c in courses if c.get("id") == course_id), None)
     if course is None:
         return None
+
     category_id = course.get("category")
     category_name: Optional[str] = None
     if category_id is not None:
@@ -88,29 +102,65 @@ async def _resolve_course_dir(
             category_name = await client.get_category_name(int(category_id))
         except (TypeError, ValueError):
             pass
-    return build_course_dir(config.download_root, config.url or "", category_name, course)
+
+    course_dir = build_course_dir(
+        config.download_root, config.url or "", category_name, course
+    )
+
+    assignments = await client.get_assignments(course_id)
+    target = next((a for a in assignments if a.get("id") == assign_id), None)
+    if target is None:
+        return None
+    cmid = target.get("cmid")
+    if cmid is None:
+        return None
+    try:
+        cmid_int = int(cmid)
+    except (TypeError, ValueError):
+        return None
+
+    sections = await client.get_course_contents(course_id)
+    for idx, section in enumerate(sections):
+        for module in section.get("modules") or []:
+            if module.get("id") == cmid_int:
+                section_dir = build_section_dir(course_dir, section.get("name"), idx)
+                module_dir = build_module_dir(
+                    section_dir, module.get("name"), module.get("modname")
+                )
+                return module_submission_dir(module_dir)
+    return None
 
 
 async def _resolve_file_paths(
     client: MoodleClient,
     config: MoodleConfig,
     course_id: int,
+    assign_id: int,
     raw_paths: list[str],
 ) -> tuple[list[Path], list[str]]:
-    """Return (resolved_existing, missing). Relative paths resolved against Abgaben/."""
+    """Return ``(existing, missing)``.
+
+    Absolute paths are used as-is; relative paths are resolved against the
+    Moodle assignment's per-module ``Abgabe/`` folder.
+    """
     resolved: list[Path] = []
     missing: list[str] = []
-    course_dir_cache: Optional[Path] = None
+    abgabe_dir_cache: Optional[Path] = None
 
     for raw in raw_paths:
         p = Path(raw).expanduser()
         if not p.is_absolute():
-            if course_dir_cache is None:
-                course_dir_cache = await _resolve_course_dir(client, config, course_id)
-            if course_dir_cache is None:
-                missing.append(f"{raw} (Kurs {course_id} nicht gefunden)")
+            if abgabe_dir_cache is None:
+                abgabe_dir_cache = await _resolve_assignment_abgabe_dir(
+                    client, config, course_id, assign_id
+                )
+            if abgabe_dir_cache is None:
+                missing.append(
+                    f"{raw} (Aufgabe {assign_id} in Kurs {course_id} nicht auffindbar — "
+                    "download_course zuerst ausführen oder absoluten Pfad angeben)"
+                )
                 continue
-            p = course_dir_cache / SUBMISSIONS_DIR / raw
+            p = abgabe_dir_cache / raw
         if p.is_file():
             resolved.append(p)
         else:
@@ -165,7 +215,9 @@ async def submit_assignment(
     final: bool = False,
 ) -> str:
     file_paths = file_paths or []
-    resolved, missing = await _resolve_file_paths(client, config, course_id, file_paths)
+    resolved, missing = await _resolve_file_paths(
+        client, config, course_id, assign_id, file_paths
+    )
 
     if missing:
         return (

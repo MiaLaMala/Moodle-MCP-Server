@@ -111,16 +111,24 @@ async def main() -> int:
                     print(f"download_course.{key}: {ln.strip('- ').strip()}")
                     break
 
-        # Inspect created structure, count files without printing names.
+        # Inspect created v2.1 structure, count files without printing names.
         host_dir = tmpdir / "lms.lernen.hamburg"
         if host_dir.exists():
             md_count = sum(1 for _ in host_dir.rglob("*.md"))
             all_files = sum(1 for p in host_dir.rglob("*") if p.is_file())
-            abgaben_dirs = sum(1 for p in host_dir.rglob("Abgaben") if p.is_dir())
+            abgabe_dirs = sum(1 for p in host_dir.rglob("Abgabe") if p.is_dir())
             anhaenge_dirs = sum(1 for p in host_dir.rglob("Anhänge") if p.is_dir())
-            print(f"fs.md_files: {md_count}")
+            aufgaben_groups = sum(1 for p in host_dir.rglob("Aufgaben") if p.is_dir())
+            infotexte_groups = sum(1 for p in host_dir.rglob("Infotexte") if p.is_dir())
+            kurs_md = sum(1 for p in host_dir.rglob("Kurs.md") if p.is_file())
+            section_md = sum(1 for p in host_dir.rglob("Section.md") if p.is_file())
+            print(f"fs.md_files_total: {md_count}")
             print(f"fs.total_files: {all_files}")
-            print(f"fs.Abgaben_dirs: {abgaben_dirs}")
+            print(f"fs.Kurs.md: {kurs_md}")
+            print(f"fs.Section.md: {section_md}")
+            print(f"fs.Aufgaben_groups: {aufgaben_groups}")
+            print(f"fs.Infotexte_groups: {infotexte_groups}")
+            print(f"fs.Abgabe_dirs: {abgabe_dirs}")
             print(f"fs.Anhänge_dirs: {anhaenge_dirs}")
 
         # submit_assignment dry-run (no confirm) — safe, no writes to Moodle.

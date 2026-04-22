@@ -25,25 +25,34 @@ HTML von Moodle wird zu sauberem Plaintext konvertiert. Aufgaben bekommen ihr `d
 
 Alles landet Obsidian-freundlich in `~/Documents/<moodle-host>/<kategorie>/<kurs>/`:
 
+Ab v2.1 bekommt **jede Aufgabe und jedes Infotext-Modul einen eigenen
+Arbeits-Ordner**, damit Notizen, Anhänge und deine Abgaben-Dateien zu einer
+Aufgabe alle an einem Ort liegen:
+
 ```
 ~/Documents/
-└── lms.lernen.hamburg/
-    └── Lernfeld 3/                      ← deine Moodle-Kategorie; hier
-        │                                  kannst du auch eigene Notizen/
-        │                                  Projekte ablegen
-        └── Kurse/                       ← alles Moodle-Importierte liegt hier
-            └── IT25-Klassenseite/
-                ├── IT25-Klassenseite.md ← YAML-Frontmatter, relative Links
-                ├── Anhänge/
-                │   ├── 01 - Section 1/
-                │   │   └── <Modulname>/
-                │   │       ├── script.pdf
-                │   │       └── aufgabe.docx
-                │   └── 02 - Section 2/
-                │       └── …
-                └── Abgaben/             ← hier legst DU Files rein für submit
-                    └── README.md
+└── lms.lernen.hamburg/                   ← Moodle-Host (aus URL)
+    └── Fachinformatik/                   ← Moodle-Kategorie
+        └── IT25- Klassenseite/           ← Moodle-Kurs (fullname)
+            ├── Kurs.md                   ← Kurs-Übersicht + Links zu Sections
+            └── Kurse/                    ← fix (gruppiert Sections)
+                └── Fachenglisch/         ← Moodle-Section
+                    ├── Section.md        ← Section-Übersicht + Links zu Modulen
+                    ├── Aufgaben/         ← fix (modname=assign)
+                    │   └── Letter of Application/
+                    │       ├── Letter of Application.md   ← Aufgabenstellung
+                    │       ├── Anhänge/  ← vom Lehrer beigefügte Dateien
+                    │       └── Abgabe/   ← DU legst hier Files für submit rein
+                    └── Infotexte/        ← fix (page / label / book / resource / url / …)
+                        └── Vokabelliste/
+                            ├── Vokabelliste.md
+                            └── Anhänge/
 ```
+
+**Warum die extra `Kurse/`-, `Aufgaben/`- und `Infotexte/`-Ordner?**
+Damit du im Lernfeld-Ordner selbst (z.B. `Fachinformatik/`) und im Kurs-Ordner
+selbst (`IT25- Klassenseite/`) eigene Notizen, Projekte und Recherchen ablegen
+kannst, ohne dass `download_course` sie anfasst oder überschreibt.
 
 Die `.md` hat YAML-Frontmatter (`type: moodle-course`, `course_id`, `category`, `tags: [moodle]`) und relative Markdown-Links auf die Anhänge — rendert in Obsidian sofort korrekt, inklusive Datei-Vorschau.
 
@@ -63,7 +72,7 @@ Einreichen ist kaum reversibel, deshalb dreistufig:
 
 Zusätzlich:
 - Jede echte Aktion landet in `~/.moodle-mcp/submissions.log` (Zeit, Kurs, Assign, Dateinamen, Größen — niemals Text-Inhalt).
-- Relative Pfade in `file_paths` werden gegen `<Kurs>/Abgaben/` aufgelöst, absolute Pfade direkt genommen.
+- Relative Pfade in `file_paths` werden gegen `<Modul>/Abgabe/` aufgelöst (benötigt, dass der Kurs vorher via `download_course` gesynct wurde). Absolute Pfade werden direkt genommen.
 - Claude wird angewiesen, das Tool niemals ohne User-Bestätigung mit `i_confirm=True` aufzurufen.
 
 ---
@@ -171,8 +180,9 @@ Nach der Einbindung:
 - *"Welche Moodle-Kurse habe ich?"*
 - *"Lad mir den Kurs 224100 komplett runter."*
 - *"Zeig mir alle Deadlines der nächsten 14 Tage."*
-- *"Lies meine Abgabe-Datei aus Abgaben/hausaufgabe.pdf durch und reich sie im Dry-Run-Modus ein."*
-- *"Ok, jetzt wirklich einreichen als Draft."*
+- *"Öffne die Aufgabe 'Letter of Application' aus Fachenglisch und hilf mir beim Entwurf."*
+- *"Ich hab meinen Entwurf in `Abgabe/letter.pdf` abgelegt — reich ihn im Dry-Run ein."*
+- *"OK, jetzt wirklich einreichen als Draft."*
 - *"Gib's final ab."*
 
 ---
@@ -191,7 +201,7 @@ Nach der Einbindung:
 uv run pytest                          # Unit-Tests
 uv run python scripts/config_debug.py  # zeigt welche Env-Vars geladen sind
 uv run python scripts/live_smoke.py    # v1 Roundtrip gegen echte Instance
-uv run python scripts/live_smoke_v2.py # v2 mit Download in Tempdir
+uv run python scripts/live_smoke_v2.py # v2.1 Download in Tempdir + Strukturcheck
 ```
 
 Projektstruktur:
@@ -200,9 +210,9 @@ Projektstruktur:
 src/moodle_mcp/
 ├── __main__.py          # uv run moodle-mcp — lädt Config, startet FastMCP
 ├── config.py            # pydantic-settings + Fail-Fast-Validation
-├── paths.py             # Sanitization + Ordner-Layout
+├── paths.py             # Sanitization + Ordner-Layout (Kurse / Aufgaben / Infotexte)
 ├── html_utils.py        # HTML → Plaintext
-├── markdown_renderer.py # Course → Obsidian-MD
+├── markdown_renderer.py # 3-Ebenen-Renderer (Kurs / Section / Modul)
 ├── moodle_client.py     # async Web-Services-Wrapper + File-Download/Upload
 ├── downloader.py        # download_course-Orchestrator (inkl. incremental)
 ├── submissions.py       # submit/status/deadlines + Audit-Log

@@ -176,12 +176,16 @@ def create_server(config: MoodleConfig) -> FastMCP:
         """Lade den gesamten Kurs (Text + alle Anhänge) in den lokalen Dokumente-Ordner.
 
         Legt folgende Struktur an:
-            <MOODLE_DOWNLOAD_ROOT>/<host>/<Kategorie>/<Kurs>/<Kurs>.md
-                                                      /Anhänge/<Section>/<Modul>/…
-                                                      /Abgaben/   (leer, für Submit-Files)
+            <MOODLE_DOWNLOAD_ROOT>/<host>/<Kategorie>/<Kurs>/
+              Kurs.md
+              Kurse/<Section>/
+                Section.md
+                Aufgaben/<Modul>/  { <Modul>.md, Anhänge/, Abgabe/ }
+                Infotexte/<Modul>/ { <Modul>.md, Anhänge/ }
 
-        Die erzeugte .md ist Obsidian-freundlich (YAML-Frontmatter, relative Links).
-        Bereits vorhandene Dateien mit passender Größe werden übersprungen.
+        Die erzeugten .md-Dateien sind Obsidian-freundlich (YAML-Frontmatter,
+        relative Links). Dateien mit passender Größe werden beim erneuten Aufruf
+        übersprungen.
 
         Args:
             course_id: die numerische Moodle-Kurs-ID (siehe list_courses).
@@ -202,7 +206,9 @@ def create_server(config: MoodleConfig) -> FastMCP:
             "",
             f"- Kurs-ID: **{manifest.course_id}**",
             f"- Kurs-Ordner: `{manifest.course_dir}`",
-            f"- Markdown: `{manifest.markdown_path.name}`",
+            f"- Einstieg: `{manifest.kurs_md_path.name}`",
+            f"- Sections: **{manifest.section_count}**, "
+            f"Module: **{manifest.module_count}**",
             f"- Neu heruntergeladen: **{len(manifest.downloaded)}** Dateien "
             f"({manifest.total_bytes} Bytes)",
             f"- Übersprungen (bereits aktuell): **{len(manifest.skipped)}**",
@@ -237,7 +243,8 @@ def create_server(config: MoodleConfig) -> FastMCP:
             assign_id: die numerische Aufgaben-ID (aus mod_assign, siehe Kurs-Inhalt).
             text: optionaler Online-Text (Plaintext; wird zu HTML konvertiert).
             file_paths: optionale Datei-Pfade. Absolute Pfade werden direkt genommen,
-                relative Pfade werden gegen `<Kurs-Ordner>/Abgaben/` aufgelöst.
+                relative Pfade werden gegen den passenden `<Modul>/Abgabe/`-Ordner aufgelöst
+                (benötigt, dass der Kurs vorher via download_course gesynct wurde).
             i_confirm: EXPLIZIT auf True setzen, um wirklich einzureichen.
             final: zusätzlich auf True für finales Abgeben (`submit_for_grading`).
         """
