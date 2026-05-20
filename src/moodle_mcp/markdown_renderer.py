@@ -17,8 +17,26 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
 
-from .html_utils import html_to_plaintext
+from .html_utils import (
+    html_to_markdown_with_images,
+    html_to_plaintext,
+    rewrite_inline_image_srcs,
+    rewrite_pluginfile_refs,
+)
 from .paths import ASSIGNMENTS_GROUP_DIR, INFOTEXTS_GROUP_DIR, classify_module_group
+
+
+def _pluginfile_replacements(
+    attachment_paths: list[Path],
+    from_file: Path,
+) -> dict[str, str]:
+    """Map each attachment's basename to a URL-safe relative link.
+
+    Used to rewrite ``@@PLUGINFILE@@/...`` tokens in Moodle HTML so the
+    resulting markdown links point at the locally-downloaded files
+    inside the module's ``Anhänge/`` folder.
+    """
+    return {path.name: _rel_link(from_file, path) for path in attachment_paths}
 
 
 def _format_duedate(timestamp: Any) -> Optional[str]:
@@ -193,6 +211,7 @@ def render_module(
     module_md_path: Path,
     attachment_paths: list[Path],
     retrieved_at: Optional[datetime] = None,
+    inline_image_map: Optional[dict[str, Path]] = None,
 ) -> str:
     retrieved = retrieved_at or datetime.now(timezone.utc)
     name = module.get("name") or "(unbenannt)"
@@ -229,10 +248,41 @@ def render_module(
     description_html = module.get("description")
     if is_assign and assign_meta:
         description_html = assign_meta.get("intro") or description_html
-    description = html_to_plaintext(description_html or "")
+    pluginfile_replacements = _pluginfile_replacements(attachment_paths, module_md_path)
+    inline_image_replacements: dict[str, str] = {
+        digest: _rel_link(module_md_path, path)
+        for digest, path in (inline_image_map or {}).items()
+    }
+    has_inline_images = bool(inline_image_replacements)
+
+    description_html = rewrite_pluginfile_refs(description_html, pluginfile_replacements)
+    description_html = rewrite_inline_image_srcs(
+        description_html, inline_image_replacements
+    )
+    if has_inline_images:
+        description = html_to_markdown_with_images(description_html or "")
+    else:
+        description = html_to_plaintext(description_html or "")
     if description:
         lines.append(description)
         lines.append("")
+
+    # mod_page stores its body as a ``contents`` entry of type "content".
+    # Render it after the description so the page body is part of the .md.
+    if modname == "page":
+        for item in module.get("contents") or []:
+            if not isinstance(item, dict) or item.get("type") != "content":
+                continue
+            page_html = rewrite_pluginfile_refs(item.get("content") or "", pluginfile_replacements)
+            page_html = rewrite_inline_image_srcs(page_html, inline_image_replacements)
+            page_text = (
+                html_to_markdown_with_images(page_html)
+                if has_inline_images
+                else html_to_plaintext(page_html)
+            )
+            if page_text:
+                lines.append(page_text)
+                lines.append("")
 
     if modname == "url":
         for item in module.get("contents") or []:
