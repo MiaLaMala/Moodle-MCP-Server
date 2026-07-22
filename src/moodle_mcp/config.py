@@ -66,6 +66,23 @@ class MoodleConfig(BaseSettings):
     download_root: Path = Field(default_factory=_default_download_root)
     submissions_log: Path = Field(default_factory=_default_submissions_log)
 
+    # Speed: how many files/modules are fetched concurrently, and the retry
+    # policy for transient (network/5xx/429) Web-Service errors. Kept
+    # separate from the existing single-shot 401/403 re-auth retry in
+    # ``MoodleClient._ws_call``.
+    max_concurrency: int = Field(default=6)
+    retry_max_attempts: int = Field(default=4)
+    retry_backoff_base: float = Field(default=0.5)
+
+    # Security: when true, hides/blocks the write-capable `submit_assignment`
+    # tool entirely — for deployments that only ever want read access.
+    read_only: bool = Field(default=False)
+
+    # Optional: push downloaded content into a self-hosted Open Notebook
+    # instance (https://github.com/lfnovo/open-notebook) as Sources.
+    open_notebook_url: Optional[str] = Field(default=None)
+    open_notebook_password: Optional[str] = Field(default=None)
+
     @property
     def has_direct_token(self) -> bool:
         return bool(self.token)
@@ -73,6 +90,10 @@ class MoodleConfig(BaseSettings):
     @property
     def has_password_auth(self) -> bool:
         return bool(self.username) and bool(self.password)
+
+    @property
+    def has_open_notebook(self) -> bool:
+        return bool(self.open_notebook_url)
 
     @classmethod
     def load(cls, **overrides) -> "MoodleConfig":

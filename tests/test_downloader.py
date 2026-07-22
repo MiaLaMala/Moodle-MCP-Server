@@ -125,11 +125,28 @@ class _StubClient:
         sections: list[dict[str, Any]],
         assignments: list[dict[str, Any]],
         course: dict[str, Any],
+        quizzes: list[dict[str, Any]] | None = None,
+        books: list[dict[str, Any]] | None = None,
+        forums: list[dict[str, Any]] | None = None,
+        quiz_attempts: dict[int, list[dict[str, Any]]] | None = None,
+        quiz_reviews: dict[int, dict[str, Any]] | None = None,
+        book_chapters: dict[int, list[dict[str, Any]]] | None = None,
+        forum_discussions: dict[int, list[dict[str, Any]]] | None = None,
+        forum_posts: dict[int, list[dict[str, Any]]] | None = None,
     ) -> None:
         self._sections = sections
         self._assignments = assignments
         self._course = course
+        self._quizzes = quizzes or []
+        self._books = books or []
+        self._forums = forums or []
+        self._quiz_attempts = quiz_attempts or {}
+        self._quiz_reviews = quiz_reviews or {}
+        self._book_chapters = book_chapters or {}
+        self._forum_discussions = forum_discussions or {}
+        self._forum_posts = forum_posts or {}
         self.downloads: list[str] = []
+        self.review_fetch_count = 0
 
     async def list_courses(self) -> list[dict[str, Any]]:
         return [self._course]
@@ -142,6 +159,31 @@ class _StubClient:
 
     async def get_assignments(self, course_id: int) -> list[dict[str, Any]]:
         return self._assignments
+
+    async def get_quizzes_by_courses(self, course_ids: list[int]) -> list[dict[str, Any]]:
+        return self._quizzes
+
+    async def get_quiz_user_attempts(self, quiz_id: int) -> list[dict[str, Any]]:
+        return self._quiz_attempts.get(quiz_id, [])
+
+    async def get_quiz_attempt_review(self, attempt_id: int) -> dict[str, Any]:
+        self.review_fetch_count += 1
+        return self._quiz_reviews.get(attempt_id, {})
+
+    async def get_books_by_courses(self, course_ids: list[int]) -> list[dict[str, Any]]:
+        return self._books
+
+    async def get_book_chapters(self, book_id: int) -> list[dict[str, Any]]:
+        return self._book_chapters.get(book_id, [])
+
+    async def get_forums_by_courses(self, course_ids: list[int]) -> list[dict[str, Any]]:
+        return self._forums
+
+    async def get_forum_discussions(self, forum_id: int) -> list[dict[str, Any]]:
+        return self._forum_discussions.get(forum_id, [])
+
+    async def get_forum_discussion_posts(self, discussion_id: int) -> list[dict[str, Any]]:
+        return self._forum_posts.get(discussion_id, [])
 
     async def download_file(self, file_url: str, dest_path: Path) -> int:
         self.downloads.append(file_url)
@@ -192,6 +234,183 @@ async def test_download_course_finds_assignment_by_instance_when_cmid_missing(
     assert len(written) == 1
     assert written[0].parent.name == "Anhänge"
     assert written[0].name == "Werkzeuge.pdf"
+
+
+# ---------------------------------------------------------------- quiz / book / forum / folder
+def _quiz_question_html(state: str, qtext: str, rightanswer: str, ablock: str) -> str:
+    return (
+        f'<div class="que multichoice {state}">'
+        f'<div class="qtext">{qtext}</div>'
+        f'<div class="ablock">{ablock}</div>'
+        f'<div class="rightanswer">{rightanswer}</div>'
+        "</div>"
+    )
+
+
+@pytest.mark.asyncio
+async def test_download_course_quiz_module_writes_flashcards(tmp_path: Path) -> None:
+    course = {"id": 1, "fullname": "Testkurs", "category": 1, "shortname": "TC"}
+    sections = [{
+        "name": "S1",
+        "modules": [{
+            "id": 1,
+            "instance": 500,
+            "modname": "quiz",
+            "name": "Abschlusstest",
+            "visible": 1,
+            "contents": [],
+        }],
+    }]
+    client = _StubClient(
+        sections, [], course,
+        quizzes=[{"id": 500, "name": "Abschlusstest"}],
+        quiz_attempts={500: [{"id": 9, "attempt": 1, "state": "finished"}]},
+        quiz_reviews={9: {"questions": [
+            {"slot": 1, "html": _quiz_question_html("correct", "Q1?", "A1", "A1")},
+        ]}},
+    )
+
+    manifest = await download_course(client, 1, tmp_path, "https://moodle.example")
+
+    module_dir = manifest.course_dir / "Kurse" / "S1" / "Infotexte" / "Abschlusstest"
+    flashcards_path = module_dir / "Flashcards.md"
+    assert flashcards_path.exists()
+    text = flashcards_path.read_text(encoding="utf-8")
+    assert "Q1?" in text
+    assert "A1" in text
+    assert client.review_fetch_count == 1
+
+    module_md = (module_dir / "Abschlusstest.md").read_text(encoding="utf-8")
+    assert "## Quiz" in module_md
+    assert "Flashcards.md" in module_md
+
+
+@pytest.mark.asyncio
+async def test_download_course_quiz_module_skips_review_refetch_when_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Re-running with the same latest attempt id must not re-fetch the review."""
+    course = {"id": 1, "fullname": "Testkurs", "category": 1, "shortname": "TC"}
+    sections = [{
+        "name": "S1",
+        "modules": [{
+            "id": 1, "instance": 500, "modname": "quiz",
+            "name": "Abschlusstest", "visible": 1, "contents": [],
+        }],
+    }]
+    client = _StubClient(
+        sections, [], course,
+        quizzes=[{"id": 500, "name": "Abschlusstest"}],
+        quiz_attempts={500: [{"id": 9, "attempt": 1, "state": "finished"}]},
+        quiz_reviews={9: {"questions": [
+            {"slot": 1, "html": _quiz_question_html("correct", "Q1?", "A1", "A1")},
+        ]}},
+    )
+
+    await download_course(client, 1, tmp_path, "https://moodle.example")
+    assert client.review_fetch_count == 1
+
+    await download_course(client, 1, tmp_path, "https://moodle.example")
+    assert client.review_fetch_count == 1  # cache hit, no second fetch
+
+
+@pytest.mark.asyncio
+async def test_download_course_book_module_inlines_chapters(tmp_path: Path) -> None:
+    course = {"id": 1, "fullname": "Testkurs", "category": 1, "shortname": "TC"}
+    sections = [{
+        "name": "S1",
+        "modules": [{
+            "id": 1, "instance": 600, "modname": "book",
+            "name": "Lehrbuch", "visible": 1, "contents": [],
+        }],
+    }]
+    client = _StubClient(
+        sections, [], course,
+        books=[{"id": 600, "name": "Lehrbuch"}],
+        book_chapters={600: [
+            {"title": "Kapitel 1", "content": "<p>Inhalt von Kapitel 1</p>", "hidden": 0},
+            {"title": "Verstecktes Kapitel", "content": "<p>geheim</p>", "hidden": 1},
+        ]},
+    )
+
+    manifest = await download_course(client, 1, tmp_path, "https://moodle.example")
+
+    module_md = (
+        manifest.course_dir / "Kurse" / "S1" / "Infotexte" / "Lehrbuch" / "Lehrbuch.md"
+    ).read_text(encoding="utf-8")
+    assert "## Kapitel 1" in module_md
+    assert "Inhalt von Kapitel 1" in module_md
+    assert "geheim" not in module_md  # hidden chapters are skipped
+
+
+@pytest.mark.asyncio
+async def test_download_course_forum_module_inlines_discussions_and_posts(
+    tmp_path: Path,
+) -> None:
+    course = {"id": 1, "fullname": "Testkurs", "category": 1, "shortname": "TC"}
+    sections = [{
+        "name": "S1",
+        "modules": [{
+            "id": 1, "instance": 700, "modname": "forum",
+            "name": "Ankündigungen", "visible": 1, "contents": [],
+        }],
+    }]
+    client = _StubClient(
+        sections, [], course,
+        forums=[{"id": 700, "name": "Ankündigungen"}],
+        forum_discussions={700: [{"id": 1, "name": "Diskussion A"}]},
+        forum_posts={1: [
+            {
+                "author": {"fullname": "Max Mustermann"},
+                "subject": "Betreff X",
+                "message": "<p>Hallo Welt</p>",
+            }
+        ]},
+    )
+
+    manifest = await download_course(client, 1, tmp_path, "https://moodle.example")
+
+    module_md = (
+        manifest.course_dir / "Kurse" / "S1" / "Infotexte" / "Ankündigungen" / "Ankündigungen.md"
+    ).read_text(encoding="utf-8")
+    assert "## Diskussion A" in module_md
+    assert "Max Mustermann" in module_md
+    assert "Betreff X" in module_md
+    assert "Hallo Welt" in module_md
+
+
+@pytest.mark.asyncio
+async def test_download_course_folder_module_preserves_subfolder_structure(
+    tmp_path: Path,
+) -> None:
+    """Two same-named files in different mod_folder subfolders must not collide."""
+    course = {"id": 1, "fullname": "Testkurs", "category": 1, "shortname": "TC"}
+    sections = [{
+        "name": "S1",
+        "modules": [{
+            "id": 1, "instance": 800, "modname": "folder",
+            "name": "Materialien", "visible": 1,
+            "contents": [
+                {
+                    "filename": "aufgabe.txt", "filesize": 3, "type": "file",
+                    "filepath": "/Woche1/", "fileurl": "https://m/w1/aufgabe.txt",
+                },
+                {
+                    "filename": "aufgabe.txt", "filesize": 3, "type": "file",
+                    "filepath": "/Woche2/", "fileurl": "https://m/w2/aufgabe.txt",
+                },
+            ],
+        }],
+    }]
+    client = _StubClient(sections, [], course)
+
+    manifest = await download_course(client, 1, tmp_path, "https://moodle.example")
+
+    module_dir = manifest.course_dir / "Kurse" / "S1" / "Infotexte" / "Materialien"
+    att_dir = module_dir / "Anhänge"
+    assert (att_dir / "Woche1" / "aufgabe.txt").exists()
+    assert (att_dir / "Woche2" / "aufgabe.txt").exists()
+    assert len(manifest.downloaded) == 2
 
 
 # ---------------------------------------------------------------- inline images

@@ -11,17 +11,30 @@ Section and course level also get overview `.md` files that cross-link
 into the tree, so the whole thing opens cleanly in Obsidian.
 
 Re-running the tool is cheap: any file whose on-disk size matches the
-Moodle record is skipped.
+Moodle record is skipped, and files/modules within a section are fetched
+concurrently (bounded by ``max_concurrency``) to keep large courses fast.
+
+Quiz, book, and forum modules get extra content beyond plain attachments:
+quizzes get an auto-extracted ``Flashcards.md`` (see :mod:`moodle_mcp.quiz`),
+books get their chapter text inlined, and forums get their discussion posts
+inlined — all via the generic ``extra_sections`` hook on
+:func:`moodle_mcp.markdown_renderer.render_module`.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from .html_utils import extract_inline_base64_images, extract_pluginfile_filenames
+from .html_utils import (
+    extract_inline_base64_images,
+    extract_pluginfile_filenames,
+    html_to_plaintext,
+)
 from .markdown_renderer import (
     render_course_overview,
     render_module,
@@ -30,6 +43,7 @@ from .markdown_renderer import (
 from .moodle_client import MoodleAPIError, MoodleClient
 from .paths import (
     ASSIGNMENTS_GROUP_DIR,
+    build_attachment_dest_path,
     build_course_dir,
     build_module_dir,
     build_section_dir,
@@ -38,9 +52,17 @@ from .paths import (
     module_submission_dir,
     sanitize_path_component,
 )
+from .quiz import extract_flashcards_from_review, render_flashcards_markdown
 
 
 logger = logging.getLogger("moodle_mcp.downloader")
+
+_CACHE_FILENAME = ".moodle-mcp-cache.json"
+_DEFAULT_MAX_CONCURRENCY = 6
+
+_QUIZ_MODNAMES = frozenset({"quiz"})
+_BOOK_MODNAMES = frozenset({"book"})
+_FORUM_MODNAMES = frozenset({"forum"})
 
 
 @dataclass
@@ -70,6 +92,31 @@ class DownloadManifest:
             "total_bytes": self.total_bytes,
             "failed": [{"file": name, "error": err} for name, err in self.failed],
         }
+
+
+# ---------------------------------------------------------------- per-course cache
+def _load_course_cache(course_dir: Path) -> dict[str, Any]:
+    """Load ``.moodle-mcp-cache.json`` (currently: processed quiz attempts).
+
+    Missing/corrupt cache files are treated as empty rather than raising —
+    the cache is a speed optimization, never a correctness requirement.
+    """
+    path = course_dir / _CACHE_FILENAME
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_course_cache(course_dir: Path, cache: dict[str, Any]) -> None:
+    path = course_dir / _CACHE_FILENAME
+    try:
+        path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError as err:
+        logger.warning("Konnte Cache-Datei nicht schreiben (%s): %s", path, err)
 
 
 def _module_html_bodies(
@@ -229,31 +276,24 @@ async def _find_course(client: MoodleClient, course_id: int) -> Optional[dict[st
     return None
 
 
-async def _download_module_files(
+# ---------------------------------------------------------------- concurrent downloads
+async def _download_items_concurrently(
     client: MoodleClient,
-    module: dict[str, Any],
-    assign_meta: Optional[dict[str, Any]],
-    module_dir: Path,
+    items: list[dict[str, Any]],
+    att_dir: Path,
     manifest: DownloadManifest,
+    semaphore: asyncio.Semaphore,
 ) -> list[Path]:
-    """Download every file referenced by a module into ``module_dir/Anhänge/``.
+    """Download every attachment item concurrently, bounded by ``semaphore``.
 
-    Returns the list of local file paths (both newly-downloaded and skipped),
-    in the order they were encountered. Failures are recorded in the manifest
-    and do not abort the loop.
+    ``asyncio.gather`` preserves the order of ``items`` in its result list
+    regardless of completion order, so callers still get a stable path list.
+    Failures are recorded in the manifest and reported as ``None`` (dropped
+    from the result) rather than aborting the whole batch.
     """
-    items = _collect_attachments(module, assign_meta)
-    if not items:
-        return []
 
-    att_dir = module_attachments_dir(module_dir)
-    att_dir.mkdir(parents=True, exist_ok=True)
-
-    result: list[Path] = []
-    for item in items:
-        filename = sanitize_path_component(item.get("filename") or "datei")
-        dest = att_dir / filename
-
+    async def _one(item: dict[str, Any]) -> Optional[Path]:
+        dest = build_attachment_dest_path(att_dir, item)
         expected_size = item.get("filesize")
         if (
             dest.exists()
@@ -262,25 +302,279 @@ async def _download_module_files(
             and dest.stat().st_size == expected_size
         ):
             manifest.skipped.append(dest)
-            result.append(dest)
-            continue
+            return dest
 
         file_url = item.get("fileurl")
         if not file_url:
-            continue
+            return None
 
-        try:
-            written = await client.download_file(file_url, dest)
-        except MoodleAPIError as err:
-            logger.warning("Download fehlgeschlagen für %s: %s", filename, err)
-            manifest.failed.append((str(dest), str(err)))
-            continue
+        filename = dest.name
+        async with semaphore:
+            try:
+                written = await client.download_file(file_url, dest)
+            except MoodleAPIError as err:
+                logger.warning("Download fehlgeschlagen für %s: %s", filename, err)
+                manifest.failed.append((str(dest), str(err)))
+                return None
 
         manifest.downloaded.append(dest)
         manifest.total_bytes += written
-        result.append(dest)
+        return dest
 
-    return result
+    results = await asyncio.gather(*[_one(item) for item in items])
+    return [p for p in results if p is not None]
+
+
+async def _download_module_files(
+    client: MoodleClient,
+    module: dict[str, Any],
+    assign_meta: Optional[dict[str, Any]],
+    module_dir: Path,
+    manifest: DownloadManifest,
+    semaphore: asyncio.Semaphore,
+) -> list[Path]:
+    """Download every file referenced by a module into ``module_dir/Anhänge/``.
+
+    Returns the list of local file paths (both newly-downloaded and skipped),
+    in item order. Failures are recorded in the manifest and do not abort
+    the batch.
+    """
+    items = _collect_attachments(module, assign_meta)
+    if not items:
+        return []
+    att_dir = module_attachments_dir(module_dir)
+    return await _download_items_concurrently(client, items, att_dir, manifest, semaphore)
+
+
+# ---------------------------------------------------------------- quiz / book / forum
+async def _process_quiz_module(
+    client: MoodleClient,
+    module: dict[str, Any],
+    quiz_meta: Optional[dict[str, Any]],
+    module_dir: Path,
+    quiz_cache: dict[str, Any],
+) -> list[tuple[str, str]]:
+    """Fetch the latest finished attempt and render ``Flashcards.md``.
+
+    Only Moodle's own rendered review markup is used to determine the
+    correct answer (see :mod:`moodle_mcp.quiz`) — question types without a
+    recognizable ``.rightanswer`` block (e.g. essay) get a clear placeholder
+    rather than a guessed answer.
+
+    Skips the (relatively expensive) attempt-review fetch entirely if the
+    latest finished attempt id hasn't changed since the last sync and
+    ``Flashcards.md`` already exists — the caching layer requested for
+    "nur geänderte Inhalte neu laden".
+    """
+    if quiz_meta is None or quiz_meta.get("id") is None:
+        return []
+    quiz_id = int(quiz_meta["id"])
+
+    attempts = await client.get_quiz_user_attempts(quiz_id)
+    finished = [a for a in attempts if a.get("state") == "finished"]
+    if not finished:
+        return [("Quiz", "Noch kein abgeschlossener Versuch — keine Flashcards verfügbar.")]
+
+    latest = max(finished, key=lambda a: a.get("attempt") or a.get("id") or 0)
+    attempt_id = latest.get("id")
+    attempt_no = latest.get("attempt")
+    if attempt_id is None:
+        return []
+
+    flashcards_path = module_dir / "Flashcards.md"
+    cache_key = str(quiz_id)
+    cached_entry = quiz_cache.get(cache_key)
+    if (
+        cached_entry
+        and cached_entry.get("attempt_id") == attempt_id
+        and flashcards_path.exists()
+    ):
+        logger.info(
+            "Quiz %s: Versuch %s bereits verarbeitet, überspringe Review-Fetch",
+            quiz_id, attempt_id,
+        )
+        cached_count = cached_entry.get("flashcard_count", "?")
+        return [(
+            "Quiz",
+            f"{len(finished)} abgeschlossene(r) Versuch(e). "
+            f"{cached_count} Flashcards (aus Cache, letzter Versuch {attempt_no}). "
+            "Siehe `Flashcards.md`.",
+        )]
+
+    review = await client.get_quiz_attempt_review(int(attempt_id))
+    questions = review.get("questions") or []
+    flashcards = extract_flashcards_from_review(questions)
+    quiz_name = module.get("name") or "Quiz"
+    flashcards_path.write_text(
+        render_flashcards_markdown(quiz_name, attempt_no, flashcards),
+        encoding="utf-8",
+    )
+    quiz_cache[cache_key] = {"attempt_id": attempt_id, "flashcard_count": len(flashcards)}
+
+    return [(
+        "Quiz",
+        f"{len(finished)} abgeschlossene(r) Versuch(e). "
+        f"{len(flashcards)} Flashcards extrahiert aus Versuch {attempt_no}. "
+        "Siehe `Flashcards.md`.",
+    )]
+
+
+async def _process_book_module(
+    client: MoodleClient,
+    book_meta: Optional[dict[str, Any]],
+) -> list[tuple[str, str]]:
+    """Inline every visible book chapter as its own ``extra_sections`` entry.
+
+    ``core_course_get_contents`` doesn't expose book chapter text, so this
+    is the only way to get full book coverage.
+    """
+    if book_meta is None or book_meta.get("id") is None:
+        return []
+    chapters = await client.get_book_chapters(int(book_meta["id"]))
+    sections: list[tuple[str, str]] = []
+    for chapter in chapters:
+        if chapter.get("hidden"):
+            continue
+        title = chapter.get("title") or "Kapitel"
+        text = html_to_plaintext(chapter.get("content") or "")
+        if text:
+            sections.append((title, text))
+    return sections
+
+
+async def _process_forum_module(
+    client: MoodleClient,
+    forum_meta: Optional[dict[str, Any]],
+) -> list[tuple[str, str]]:
+    """Inline every forum discussion (with all its posts) as ``extra_sections``."""
+    if forum_meta is None or forum_meta.get("id") is None:
+        return []
+    discussions = await client.get_forum_discussions(int(forum_meta["id"]))
+    sections: list[tuple[str, str]] = []
+    for discussion in discussions:
+        discussion_id = discussion.get("id")
+        if discussion_id is None:
+            discussion_id = discussion.get("discussion")
+        name = discussion.get("name") or "Diskussion"
+        posts = (
+            await client.get_forum_discussion_posts(int(discussion_id))
+            if discussion_id is not None
+            else []
+        )
+        parts: list[str] = []
+        for post in posts:
+            author = (post.get("author") or {}).get("fullname") or post.get("userfullname") or "?"
+            subject = post.get("subject") or ""
+            message = html_to_plaintext(post.get("message") or "")
+            header = f"**{author}**" + (f" — _{subject}_" if subject else "")
+            block = f"{header}\n{message}".strip()
+            if block:
+                parts.append(block)
+        body = "\n\n".join(parts)
+        if body:
+            sections.append((name, body))
+    return sections
+
+
+# ---------------------------------------------------------------- per-module pipeline
+async def _process_module(
+    client: MoodleClient,
+    course: dict[str, Any],
+    section: dict[str, Any],
+    module: dict[str, Any],
+    section_dir: Path,
+    assign_by_cmid: dict[int, dict[str, Any]],
+    assign_by_instance: dict[int, dict[str, Any]],
+    quiz_by_instance: dict[int, dict[str, Any]],
+    book_by_instance: dict[int, dict[str, Any]],
+    forum_by_instance: dict[int, dict[str, Any]],
+    quiz_cache: dict[str, Any],
+    manifest: DownloadManifest,
+    semaphore: asyncio.Semaphore,
+) -> Optional[tuple[dict[str, Any], Optional[dict[str, Any]], Path]]:
+    """Download + render one module. Returns ``None`` for hidden/malformed modules."""
+    if not module.get("visible", 1):
+        return None
+    cmid = module.get("id")
+    if cmid is None:
+        return None
+    try:
+        cmid_int = int(cmid)
+    except (TypeError, ValueError):
+        return None
+
+    module_name = module.get("name") or f"Modul {cmid_int}"
+    modname = module.get("modname") or "unknown"
+    module_dir = build_module_dir(section_dir, module_name, modname)
+    module_dir.mkdir(parents=True, exist_ok=True)
+
+    assign_meta = assign_by_cmid.get(cmid_int)
+    if assign_meta is None and modname == "assign":
+        instance = module.get("instance")
+        if instance is not None:
+            try:
+                assign_meta = assign_by_instance.get(int(instance))
+            except (TypeError, ValueError):
+                assign_meta = None
+
+    attachment_paths = await _download_module_files(
+        client=client,
+        module=module,
+        assign_meta=assign_meta,
+        module_dir=module_dir,
+        manifest=manifest,
+        semaphore=semaphore,
+    )
+    inline_paths, inline_image_map = _save_inline_images(
+        module=module,
+        assign_meta=assign_meta,
+        module_dir=module_dir,
+        manifest=manifest,
+    )
+    attachment_paths = attachment_paths + inline_paths
+
+    # Abgabe/ folder only for assign-type modules
+    if classify_module_group(modname) == ASSIGNMENTS_GROUP_DIR:
+        module_submission_dir(module_dir).mkdir(parents=True, exist_ok=True)
+
+    instance_int: Optional[int] = None
+    instance = module.get("instance")
+    if instance is not None:
+        try:
+            instance_int = int(instance)
+        except (TypeError, ValueError):
+            instance_int = None
+
+    extra_sections: list[tuple[str, str]] = []
+    if modname in _QUIZ_MODNAMES:
+        quiz_meta = quiz_by_instance.get(instance_int) if instance_int is not None else None
+        extra_sections = await _process_quiz_module(
+            client, module, quiz_meta, module_dir, quiz_cache
+        )
+    elif modname in _BOOK_MODNAMES:
+        book_meta = book_by_instance.get(instance_int) if instance_int is not None else None
+        extra_sections = await _process_book_module(client, book_meta)
+    elif modname in _FORUM_MODNAMES:
+        forum_meta = forum_by_instance.get(instance_int) if instance_int is not None else None
+        extra_sections = await _process_forum_module(client, forum_meta)
+
+    module_md_name = sanitize_path_component(module_name) + ".md"
+    module_md_path = module_dir / module_md_name
+    module_md_path.write_text(
+        render_module(
+            course=course,
+            section=section,
+            module=module,
+            assign_meta=assign_meta,
+            module_md_path=module_md_path,
+            attachment_paths=attachment_paths,
+            inline_image_map=inline_image_map,
+            extra_sections=extra_sections,
+        ),
+        encoding="utf-8",
+    )
+
+    return module, assign_meta, module_md_path
 
 
 async def download_course(
@@ -288,6 +582,7 @@ async def download_course(
     course_id: int,
     download_root: Path,
     moodle_url: str,
+    max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
 ) -> DownloadManifest:
     course = await _find_course(client, course_id)
     if course is None:
@@ -324,6 +619,36 @@ async def download_course(
             except (TypeError, ValueError):
                 pass
 
+    # Quiz/book/forum metadata is fetched once per course (like assignments
+    # above) rather than once per module — these WS calls are cheap relative
+    # to the per-attempt/per-chapter/per-discussion follow-ups below.
+    quiz_by_instance: dict[int, dict[str, Any]] = {}
+    for z in await client.get_quizzes_by_courses([course_id]):
+        if z.get("id") is not None:
+            try:
+                quiz_by_instance[int(z["id"])] = z
+            except (TypeError, ValueError):
+                pass
+
+    book_by_instance: dict[int, dict[str, Any]] = {}
+    for b in await client.get_books_by_courses([course_id]):
+        if b.get("id") is not None:
+            try:
+                book_by_instance[int(b["id"])] = b
+            except (TypeError, ValueError):
+                pass
+
+    forum_by_instance: dict[int, dict[str, Any]] = {}
+    for f in await client.get_forums_by_courses([course_id]):
+        if f.get("id") is not None:
+            try:
+                forum_by_instance[int(f["id"])] = f
+            except (TypeError, ValueError):
+                pass
+
+    quiz_cache: dict[str, Any] = _load_course_cache(course_dir).get("quiz_attempts", {})
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
     kurs_md_path = course_dir / "Kurs.md"
     manifest = DownloadManifest(
         course_id=course_id,
@@ -340,69 +665,32 @@ async def download_course(
         section_dir.mkdir(parents=True, exist_ok=True)
         section_md_path = section_dir / "Section.md"
 
-        modules_with_paths: list[tuple[dict[str, Any], dict[str, Any] | None, Path]] = []
         modules = section.get("modules") or []
 
-        for module in modules:
-            if not module.get("visible", 1):
-                continue
-            cmid = module.get("id")
-            if cmid is None:
-                continue
-            try:
-                cmid_int = int(cmid)
-            except (TypeError, ValueError):
-                continue
-
-            module_name = module.get("name") or f"Modul {cmid_int}"
-            modname = module.get("modname") or "unknown"
-            module_dir = build_module_dir(section_dir, module_name, modname)
-            module_dir.mkdir(parents=True, exist_ok=True)
-
-            assign_meta = assign_by_cmid.get(cmid_int)
-            if assign_meta is None and modname == "assign":
-                instance = module.get("instance")
-                if instance is not None:
-                    try:
-                        assign_meta = assign_by_instance.get(int(instance))
-                    except (TypeError, ValueError):
-                        assign_meta = None
-            attachment_paths = await _download_module_files(
+        # Modules within a section are processed concurrently (files +
+        # quiz/book/forum fetches), bounded by ``semaphore``.
+        # asyncio.gather preserves input order in its results, so
+        # Section.md still lists modules in their original Moodle order.
+        results = await asyncio.gather(*[
+            _process_module(
                 client=client,
+                course=course,
+                section=section,
                 module=module,
-                assign_meta=assign_meta,
-                module_dir=module_dir,
+                section_dir=section_dir,
+                assign_by_cmid=assign_by_cmid,
+                assign_by_instance=assign_by_instance,
+                quiz_by_instance=quiz_by_instance,
+                book_by_instance=book_by_instance,
+                forum_by_instance=forum_by_instance,
+                quiz_cache=quiz_cache,
                 manifest=manifest,
+                semaphore=semaphore,
             )
-            inline_paths, inline_image_map = _save_inline_images(
-                module=module,
-                assign_meta=assign_meta,
-                module_dir=module_dir,
-                manifest=manifest,
-            )
-            attachment_paths.extend(inline_paths)
-
-            # Abgabe/ folder only for assign-type modules
-            if classify_module_group(modname) == ASSIGNMENTS_GROUP_DIR:
-                module_submission_dir(module_dir).mkdir(parents=True, exist_ok=True)
-
-            module_md_name = sanitize_path_component(module_name) + ".md"
-            module_md_path = module_dir / module_md_name
-            module_md_path.write_text(
-                render_module(
-                    course=course,
-                    section=section,
-                    module=module,
-                    assign_meta=assign_meta,
-                    module_md_path=module_md_path,
-                    attachment_paths=attachment_paths,
-                    inline_image_map=inline_image_map,
-                ),
-                encoding="utf-8",
-            )
-
-            modules_with_paths.append((module, assign_meta, module_md_path))
-            manifest.module_count += 1
+            for module in modules
+        ])
+        modules_with_paths = [r for r in results if r is not None]
+        manifest.module_count += len(modules_with_paths)
 
         section_md_path.write_text(
             render_section_overview(
@@ -426,5 +714,7 @@ async def download_course(
         ),
         encoding="utf-8",
     )
+
+    _save_course_cache(course_dir, {"quiz_attempts": quiz_cache})
 
     return manifest
