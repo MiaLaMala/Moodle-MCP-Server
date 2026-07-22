@@ -94,3 +94,38 @@ def test_env_vars_are_picked_up(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = MoodleConfig.load(_env_file=None)
     assert cfg.url == "https://moodle.example.com"
     assert cfg.token == "from-env"
+
+
+# ---------------------------------------------------------------- speed/security/open-notebook fields
+def test_new_fields_have_sensible_defaults() -> None:
+    cfg = _load(url="https://moodle.example.com", token="abc")
+    assert cfg.max_concurrency == 6
+    assert cfg.retry_max_attempts == 4
+    assert cfg.retry_backoff_base == 0.5
+    assert cfg.read_only is False
+    assert cfg.open_notebook_url is None
+    assert cfg.open_notebook_password is None
+    assert cfg.has_open_notebook is False
+
+
+def test_open_notebook_url_enables_has_open_notebook() -> None:
+    cfg = _load(
+        url="https://moodle.example.com",
+        token="abc",
+        open_notebook_url="https://notebook-api.example.dev",
+    )
+    assert cfg.has_open_notebook is True
+
+
+def test_read_only_and_tuning_fields_settable_via_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MOODLE_URL", "https://moodle.example.com")
+    monkeypatch.setenv("MOODLE_TOKEN", "abc")
+    monkeypatch.setenv("MOODLE_READ_ONLY", "true")
+    monkeypatch.setenv("MOODLE_MAX_CONCURRENCY", "2")
+    monkeypatch.setenv("MOODLE_RETRY_MAX_ATTEMPTS", "1")
+    monkeypatch.setenv("MOODLE_RETRY_BACKOFF_BASE", "0.1")
+    cfg = MoodleConfig.load(_env_file=None)
+    assert cfg.read_only is True
+    assert cfg.max_concurrency == 2
+    assert cfg.retry_max_attempts == 1
+    assert cfg.retry_backoff_base == 0.1

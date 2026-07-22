@@ -12,6 +12,7 @@ from moodle_mcp.paths import (
     COURSES_DIR,
     INFOTEXTS_GROUP_DIR,
     SUBMISSION_DIR,
+    build_attachment_dest_path,
     build_course_dir,
     build_module_dir,
     build_section_dir,
@@ -139,3 +140,52 @@ def test_full_layout_composes_as_expected(tmp_path: Path) -> None:
     assert mod_dir == expected
     assert module_submission_dir(mod_dir) == expected / "Abgabe"
     assert module_attachments_dir(mod_dir) == expected / "Anhänge"
+
+
+# ---------------------------------------------------------------- attachment dest path
+def test_build_attachment_dest_path_flat_when_no_filepath(tmp_path: Path) -> None:
+    att_dir = tmp_path / "Anhänge"
+    item = {"filename": "Skript.pdf"}
+    assert build_attachment_dest_path(att_dir, item) == att_dir / "Skript.pdf"
+
+
+def test_build_attachment_dest_path_flat_when_root_filepath(tmp_path: Path) -> None:
+    att_dir = tmp_path / "Anhänge"
+    item = {"filename": "Skript.pdf", "filepath": "/"}
+    assert build_attachment_dest_path(att_dir, item) == att_dir / "Skript.pdf"
+
+
+def test_build_attachment_dest_path_nests_mod_folder_subfolders(tmp_path: Path) -> None:
+    att_dir = tmp_path / "Anhänge"
+    item = {"filename": "Aufgabe.docx", "filepath": "/Unterordner/"}
+    result = build_attachment_dest_path(att_dir, item)
+    assert result == att_dir / "Unterordner" / "Aufgabe.docx"
+
+
+def test_build_attachment_dest_path_nests_multiple_levels(tmp_path: Path) -> None:
+    att_dir = tmp_path / "Anhänge"
+    item = {"filename": "x.txt", "filepath": "/A/B/C/"}
+    result = build_attachment_dest_path(att_dir, item)
+    assert result == att_dir / "A" / "B" / "C" / "x.txt"
+
+
+def test_build_attachment_dest_path_avoids_collision_across_subfolders(tmp_path: Path) -> None:
+    """Two same-named files in different subfolders must not collide."""
+    att_dir = tmp_path / "Anhänge"
+    a = build_attachment_dest_path(att_dir, {"filename": "same.txt", "filepath": "/Ordner1/"})
+    b = build_attachment_dest_path(att_dir, {"filename": "same.txt", "filepath": "/Ordner2/"})
+    assert a != b
+
+
+def test_build_attachment_dest_path_sanitizes_subfolder_names(tmp_path: Path) -> None:
+    att_dir = tmp_path / "Anhänge"
+    item = {"filename": "x.txt", "filepath": "/con:tains<illegal>/"}
+    result = build_attachment_dest_path(att_dir, item)
+    assert result.parent.name == sanitize_path_component("con:tains<illegal>")
+    assert "<" not in result.parent.name and ":" not in result.parent.name
+
+
+def test_build_attachment_dest_path_falls_back_filename(tmp_path: Path) -> None:
+    att_dir = tmp_path / "Anhänge"
+    result = build_attachment_dest_path(att_dir, {})
+    assert result == att_dir / "datei"

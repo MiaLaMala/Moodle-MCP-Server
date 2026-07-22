@@ -212,6 +212,7 @@ def render_module(
     attachment_paths: list[Path],
     retrieved_at: Optional[datetime] = None,
     inline_image_map: Optional[dict[str, Path]] = None,
+    extra_sections: Optional[list[tuple[str, str]]] = None,
 ) -> str:
     retrieved = retrieved_at or datetime.now(timezone.utc)
     name = module.get("name") or "(unbenannt)"
@@ -291,6 +292,14 @@ def render_module(
                 if url:
                     lines.append(f"**Externer Link:** {url}")
                     lines.append("")
+
+    for heading, body in extra_sections or []:
+        if not body:
+            continue
+        lines.append(f"## {heading}")
+        lines.append("")
+        lines.append(body)
+        lines.append("")
 
     if attachment_paths:
         lines.append("## Anhänge")

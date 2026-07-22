@@ -115,3 +115,21 @@ def module_attachments_dir(module_dir: Path) -> Path:
 
 def module_submission_dir(module_dir: Path) -> Path:
     return module_dir / SUBMISSION_DIR
+
+
+def build_attachment_dest_path(att_dir: Path, item: dict[str, Any]) -> Path:
+    """Compose the destination path for one downloadable file item.
+
+    ``mod_folder`` items carry a ``filepath`` like ``/Unterordner/`` for
+    nested subfolders. Without honoring it, two same-named files in
+    different subfolders of one folder module would collide on disk.
+    Non-folder items typically have ``filepath in (None, "/")`` and land
+    directly in ``att_dir``, matching the previous flat behaviour.
+    """
+    filename = sanitize_path_component(item.get("filename") or "datei")
+    filepath = item.get("filepath") or ""
+    dest_dir = att_dir
+    for part in filepath.split("/"):
+        if part:
+            dest_dir = dest_dir / sanitize_path_component(part)
+    return dest_dir / filename

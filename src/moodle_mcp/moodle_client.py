@@ -8,8 +8,10 @@ local cache, and wraps the two REST calls needed by the MCP tools:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
 from pathlib import Path
 from typing import Any, Optional
 
@@ -27,6 +29,25 @@ class MoodleAuthError(RuntimeError):
 
 class MoodleAPIError(RuntimeError):
     """Raised when a Web Services call returns an exception payload."""
+
+
+class _TransientError(RuntimeError):
+    """Internal marker for retryable failures (timeouts, 5xx, 429).
+
+    Never escapes the client — callers only ever see :class:`MoodleAPIError`.
+    Kept separate from the 401/403 re-auth retry in :meth:`MoodleClient._ws_call`,
+    which addresses an unrelated failure mode (expired token, not an
+    overloaded/flaky server).
+    """
+
+
+_TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+
+
+async def _sleep_backoff(base: float, attempt: int) -> None:
+    """Exponential backoff with jitter: ``base * 2**attempt + U(0, base)``."""
+    delay = base * (2**attempt) + random.uniform(0, base)
+    await asyncio.sleep(delay)
 
 
 def _looks_like_mobile_service_disabled(payload: dict[str, Any]) -> bool:
@@ -165,6 +186,44 @@ class MoodleClient:
         self._token = await self._exchange_token()
         return self._token
 
+    # ------------------------------------------------------------------ retry/backoff
+    async def _post_with_retry(self, url: str, data: dict[str, Any]) -> httpx.Response:
+        """POST with exponential-backoff retries for transient failures.
+
+        Retries network errors (timeouts, connection resets) and HTTP
+        429/5xx responses up to ``config.retry_max_attempts`` times.
+        Anything else (including 401/403, handled separately by the
+        caller's re-auth logic) is returned/raised immediately.
+        """
+        attempts = max(1, self.config.retry_max_attempts)
+        last_err: Optional[Exception] = None
+        for attempt in range(attempts):
+            try:
+                response = await self._http.post(url, data=data)
+            except httpx.HTTPError as err:
+                last_err = err
+                if attempt + 1 >= attempts:
+                    raise MoodleAPIError(f"Netzwerkfehler: {err}") from err
+                logger.info(
+                    "Transienter Netzwerkfehler (Versuch %s/%s): %s",
+                    attempt + 1, attempts, err,
+                )
+                await _sleep_backoff(self.config.retry_backoff_base, attempt)
+                continue
+
+            if response.status_code in _TRANSIENT_STATUS and attempt + 1 < attempts:
+                logger.info(
+                    "Transienter HTTP %s (Versuch %s/%s), retry...",
+                    response.status_code, attempt + 1, attempts,
+                )
+                await _sleep_backoff(self.config.retry_backoff_base, attempt)
+                continue
+            return response
+
+        # Unreachable in practice (loop always returns or raises above), but
+        # keeps mypy/pyright happy about the return type.
+        raise MoodleAPIError(f"Netzwerkfehler: {last_err}")
+
     # ------------------------------------------------------------------ WS core
     async def _ws_call(
         self,
@@ -182,10 +241,7 @@ class MoodleClient:
         if params:
             full_params.update(params)
 
-        try:
-            response = await self._http.post(url, data=full_params)
-        except httpx.HTTPError as err:
-            raise MoodleAPIError(f"Netzwerkfehler bei {function}: {err}") from err
+        response = await self._post_with_retry(url, full_params)
 
         if response.status_code in (401, 403):
             if _retry:
@@ -291,23 +347,177 @@ class MoodleClient:
                     return name.strip()
         return None
 
+    # ------------------------------------------------------------------ quizzes
+    async def get_quizzes_by_courses(self, course_ids: list[int]) -> list[dict[str, Any]]:
+        """List quiz activities for the given courses via ``mod_quiz_get_quizzes_by_courses``.
+
+        Returns an empty list on failure (missing capability, quiz module
+        disabled, …) — quiz coverage is an enrichment, not core functionality.
+        """
+        params: dict[str, Any] = {}
+        for i, cid in enumerate(course_ids):
+            params[f"courseids[{i}]"] = cid
+        try:
+            result = await self._ws_call("mod_quiz_get_quizzes_by_courses", params)
+        except MoodleAPIError as err:
+            logger.warning("mod_quiz_get_quizzes_by_courses failed: %s", err)
+            return []
+        if not isinstance(result, dict):
+            return []
+        return result.get("quizzes") or []
+
+    async def get_quiz_user_attempts(self, quiz_id: int) -> list[dict[str, Any]]:
+        """List the current user's own attempts at a quiz.
+
+        Uses ``status="all"`` so finished, in-progress, and abandoned
+        attempts are all visible — the caller decides which to review.
+        """
+        try:
+            result = await self._ws_call(
+                "mod_quiz_get_user_attempts",
+                {"quizid": quiz_id, "status": "all", "includepreviews": 0},
+            )
+        except MoodleAPIError as err:
+            logger.warning("mod_quiz_get_user_attempts failed for quiz=%s: %s", quiz_id, err)
+            return []
+        if not isinstance(result, dict):
+            return []
+        return result.get("attempts") or []
+
+    async def get_quiz_attempt_review(self, attempt_id: int) -> dict[str, Any]:
+        """Fetch the rendered review (question + correct answer + state) for one attempt.
+
+        Requires the ``mod/quiz:reviewmyattempts`` capability (own attempts,
+        available since Moodle 3.1). Returns ``{}`` on failure so the
+        caller can skip that attempt instead of aborting the whole sync.
+        """
+        try:
+            result = await self._ws_call(
+                "mod_quiz_get_attempt_review",
+                {"attemptid": attempt_id, "page": -1},
+            )
+        except MoodleAPIError as err:
+            logger.warning(
+                "mod_quiz_get_attempt_review failed for attempt=%s: %s", attempt_id, err
+            )
+            return {}
+        return result if isinstance(result, dict) else {}
+
+    # ------------------------------------------------------------------ books
+    async def get_books_by_courses(self, course_ids: list[int]) -> list[dict[str, Any]]:
+        """List ``mod_book`` instances (with chapters) for the given courses.
+
+        ``core_course_get_contents`` does not expose book chapter text, so
+        this dedicated call is needed for full book coverage.
+        """
+        params: dict[str, Any] = {}
+        for i, cid in enumerate(course_ids):
+            params[f"courseids[{i}]"] = cid
+        try:
+            result = await self._ws_call("mod_book_get_books_by_courses", params)
+        except MoodleAPIError as err:
+            logger.warning("mod_book_get_books_by_courses failed: %s", err)
+            return []
+        if not isinstance(result, dict):
+            return []
+        return result.get("books") or []
+
+    async def get_book_chapters(self, book_id: int) -> list[dict[str, Any]]:
+        """Fetch chapter title + HTML content for one book."""
+        try:
+            result = await self._ws_call(
+                "mod_book_get_chapters",
+                {"bookid": book_id},
+            )
+        except MoodleAPIError as err:
+            logger.warning("mod_book_get_chapters failed for book=%s: %s", book_id, err)
+            return []
+        if not isinstance(result, dict):
+            return []
+        return result.get("chapters") or []
+
+    # ------------------------------------------------------------------ forums
+    async def get_forums_by_courses(self, course_ids: list[int]) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        for i, cid in enumerate(course_ids):
+            params[f"courseids[{i}]"] = cid
+        try:
+            result = await self._ws_call("mod_forum_get_forums_by_courses", params)
+        except MoodleAPIError as err:
+            logger.warning("mod_forum_get_forums_by_courses failed: %s", err)
+            return []
+        return result if isinstance(result, list) else []
+
+    async def get_forum_discussions(self, forum_id: int) -> list[dict[str, Any]]:
+        try:
+            result = await self._ws_call(
+                "mod_forum_get_forum_discussions",
+                {"forumid": forum_id},
+            )
+        except MoodleAPIError as err:
+            logger.warning("mod_forum_get_forum_discussions failed for forum=%s: %s", forum_id, err)
+            return []
+        if not isinstance(result, dict):
+            return []
+        return result.get("discussions") or []
+
+    async def get_forum_discussion_posts(self, discussion_id: int) -> list[dict[str, Any]]:
+        try:
+            result = await self._ws_call(
+                "mod_forum_get_forum_discussion_posts",
+                {"discussionid": discussion_id},
+            )
+        except MoodleAPIError as err:
+            logger.warning(
+                "mod_forum_get_forum_discussion_posts failed for discussion=%s: %s",
+                discussion_id, err,
+            )
+            return []
+        if not isinstance(result, dict):
+            return []
+        return result.get("posts") or []
+
     # ------------------------------------------------------------------ file download
     async def download_file(self, file_url: str, dest_path: "Path") -> int:
         """Stream-download a Moodle file (pluginfile.php URL) to ``dest_path``.
 
         Appends the Web Services token as a query parameter. Creates parent
         directories as needed. Returns the number of bytes written.
+
+        Transient failures (timeouts, connection errors, 429/5xx) are
+        retried with exponential backoff (``config.retry_max_attempts``);
+        each retry re-downloads the whole file since ``dest_path`` is
+        reopened in truncating mode, so partial writes never corrupt the
+        result.
         """
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        attempts = max(1, self.config.retry_max_attempts)
+        for attempt in range(attempts):
+            try:
+                return await self._download_once(file_url, dest_path)
+            except _TransientError as err:
+                if attempt + 1 >= attempts:
+                    raise MoodleAPIError(
+                        f"Datei-Download fehlgeschlagen ({file_url}): {err}"
+                    ) from err
+                logger.info(
+                    "Transienter Fehler beim Download von %s (Versuch %s/%s): %s",
+                    file_url, attempt + 1, attempts, err,
+                )
+                await _sleep_backoff(self.config.retry_backoff_base, attempt)
+        raise MoodleAPIError(f"Datei-Download fehlgeschlagen ({file_url})")
+
+    async def _download_once(self, file_url: str, dest_path: Path) -> int:
         token = await self._ensure_token()
         separator = "&" if "?" in file_url else "?"
         url = f"{file_url}{separator}token={token}"
 
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
         bytes_written = 0
         try:
             async with self._http.stream("GET", url) as response:
                 if response.status_code in (401, 403):
-                    # Try one re-auth pass.
+                    # Try one re-auth pass (unrelated to the transient-retry loop).
                     self._token = None
                     self._invalidate_cache()
                     token = await self._ensure_token()
@@ -320,13 +530,17 @@ class MoodleClient:
                                 bytes_written += len(chunk)
                     return bytes_written
 
+                if response.status_code in _TRANSIENT_STATUS:
+                    raise _TransientError(f"HTTP {response.status_code}")
                 response.raise_for_status()
                 with dest_path.open("wb") as fh:
                     async for chunk in response.aiter_bytes():
                         fh.write(chunk)
                         bytes_written += len(chunk)
-        except httpx.HTTPError as err:
+        except httpx.HTTPStatusError as err:
             raise MoodleAPIError(f"Datei-Download fehlgeschlagen ({file_url}): {err}") from err
+        except httpx.HTTPError as err:
+            raise _TransientError(str(err)) from err
         return bytes_written
 
     # ------------------------------------------------------------------ submissions

@@ -11,6 +11,8 @@ from .config import MoodleConfig
 from .downloader import download_course as run_download_course
 from .html_utils import html_to_plaintext
 from .moodle_client import MoodleAPIError, MoodleAuthError, MoodleClient
+from .open_notebook_client import OpenNotebookError
+from .open_notebook_sync import push_course_to_open_notebook
 from .submissions import (
     get_submission_status as run_get_submission_status,
     get_upcoming_deadlines as run_get_upcoming_deadlines,
@@ -197,6 +199,7 @@ def create_server(config: MoodleConfig) -> FastMCP:
                 course_id=course_id,
                 download_root=config.download_root,
                 moodle_url=config.url or "",
+                max_concurrency=config.max_concurrency,
             )
         except (MoodleAuthError, MoodleAPIError) as err:
             return f"Fehler: {err}"
@@ -220,48 +223,72 @@ def create_server(config: MoodleConfig) -> FastMCP:
         return "\n".join(lines)
 
     @mcp.tool()
-    async def submit_assignment(
-        course_id: int,
-        assign_id: int,
-        text: Optional[str] = None,
-        file_paths: Optional[list[str]] = None,
-        i_confirm: bool = False,
-        final: bool = False,
-    ) -> str:
-        """Reicht eine Aufgabe in Moodle ein.
+    async def push_to_open_notebook(course_id: int) -> str:
+        """Synct den Kurs lokal (wie download_course) und pusht ihn als Sources in Open Notebook.
 
-        ⚠️  WICHTIG — destruktiv / kaum reversibel. Verhalten nach `i_confirm`:
+        Lernfeld-Mapping: die Moodle-Kategorie (z.B. "Fachinformatik") wird zum
+        Open-Notebook-Notebook; der Kurs selbst wird als Tag (`topics`) auf jede
+        Source gesetzt. Erneutes Ausführen ist günstig — unveränderte Dateien
+        werden anhand eines Content-Hashes übersprungen, geänderte Dateien werden
+        per Delete+Recreate aktualisiert (Open Notebooks API kann Source-Inhalte
+        nicht in-place ersetzen).
 
-        - `i_confirm=False` (Default): **DRY RUN** — zeigt nur, was eingereicht würde.
-        - `i_confirm=True, final=False`: speichert als **Draft** in Moodle (reversibel).
-        - `i_confirm=True, final=True`: ruft **mod_assign_submit_for_grading** auf.
-
-        Niemals ohne ausdrückliche Bestätigung des Users mit `i_confirm=True` aufrufen.
+        Benötigt MOODLE_OPEN_NOTEBOOK_URL (und optional MOODLE_OPEN_NOTEBOOK_PASSWORD,
+        falls dein Open-Notebook-Server mit Passwortschutz läuft) in der .env.
 
         Args:
-            course_id: die Kurs-ID (für Pfad-Auflösung der file_paths).
-            assign_id: die numerische Aufgaben-ID (aus mod_assign, siehe Kurs-Inhalt).
-            text: optionaler Online-Text (Plaintext; wird zu HTML konvertiert).
-            file_paths: optionale Datei-Pfade. Absolute Pfade werden direkt genommen,
-                relative Pfade werden gegen den passenden `<Modul>/Abgabe/`-Ordner aufgelöst
-                (benötigt, dass der Kurs vorher via download_course gesynct wurde).
-            i_confirm: EXPLIZIT auf True setzen, um wirklich einzureichen.
-            final: zusätzlich auf True für finales Abgeben (`submit_for_grading`).
+            course_id: die numerische Moodle-Kurs-ID (siehe list_courses).
         """
         try:
             client = await get_client()
-            return await run_submit_assignment(
-                client=client,
-                config=config,
-                course_id=course_id,
-                assign_id=assign_id,
-                text=text,
-                file_paths=file_paths,
-                i_confirm=i_confirm,
-                final=final,
-            )
-        except (MoodleAuthError, MoodleAPIError) as err:
+            return await push_course_to_open_notebook(client, config, course_id)
+        except (MoodleAuthError, MoodleAPIError, OpenNotebookError) as err:
             return f"Fehler: {err}"
+
+    if not config.read_only:
+        @mcp.tool()
+        async def submit_assignment(
+            course_id: int,
+            assign_id: int,
+            text: Optional[str] = None,
+            file_paths: Optional[list[str]] = None,
+            i_confirm: bool = False,
+            final: bool = False,
+        ) -> str:
+            """Reicht eine Aufgabe in Moodle ein.
+
+            ⚠️  WICHTIG — destruktiv / kaum reversibel. Verhalten nach `i_confirm`:
+
+            - `i_confirm=False` (Default): **DRY RUN** — zeigt nur, was eingereicht würde.
+            - `i_confirm=True, final=False`: speichert als **Draft** in Moodle (reversibel).
+            - `i_confirm=True, final=True`: ruft **mod_assign_submit_for_grading** auf.
+
+            Niemals ohne ausdrückliche Bestätigung des Users mit `i_confirm=True` aufrufen.
+
+            Args:
+                course_id: die Kurs-ID (für Pfad-Auflösung der file_paths).
+                assign_id: die numerische Aufgaben-ID (aus mod_assign, siehe Kurs-Inhalt).
+                text: optionaler Online-Text (Plaintext; wird zu HTML konvertiert).
+                file_paths: optionale Datei-Pfade. Absolute Pfade werden direkt genommen,
+                    relative Pfade werden gegen den passenden `<Modul>/Abgabe/`-Ordner aufgelöst
+                    (benötigt, dass der Kurs vorher via download_course gesynct wurde).
+                i_confirm: EXPLIZIT auf True setzen, um wirklich einzureichen.
+                final: zusätzlich auf True für finales Abgeben (`submit_for_grading`).
+            """
+            try:
+                client = await get_client()
+                return await run_submit_assignment(
+                    client=client,
+                    config=config,
+                    course_id=course_id,
+                    assign_id=assign_id,
+                    text=text,
+                    file_paths=file_paths,
+                    i_confirm=i_confirm,
+                    final=final,
+                )
+            except (MoodleAuthError, MoodleAPIError) as err:
+                return f"Fehler: {err}"
 
     @mcp.tool()
     async def get_submission_status(assign_id: int) -> str:
